@@ -4,8 +4,11 @@ Shared MCP server for cross-agent communication. Any number of agents (Claude, G
 
 ## Agent Naming
 
-Register as `<platform>-<role>`. The name IS the role. Examples:
-- `claude-architect`, `gemini-benchmarker`, `claude-reviewer`
+The lead registers all agents on session start and chooses names that make ownership clear. There is no enforced convention — the lead decides.
+
+Examples:
+- `claude-opus-orange` (lead), `sonnet-orange` (coder), `haiku-orange` (builder) — color = team
+- `gemini-benchmarker` — persistent researcher, self-registers
 
 ## Tools
 
@@ -19,7 +22,7 @@ Register as `<platform>-<role>`. The name IS the role. Examples:
 
 ## Rules
 
-1. **Register on session start.** First tool call should be `register`.
+1. **Lead registers all agents on session start.** Lead pre-registers its coder and builder slots, then spawns agents into them. Persistent agents (researcher) may self-register.
 2. **Check inbox after completing a task.** When you finish a task, call `check_inbox`. If messages waiting, process them before starting the next task.
 3. **Structured messages.** Format: what you did, what you found, what the recipient should do next.
 4. **Broadcast sparingly.** Only for things every agent needs immediately.
@@ -55,20 +58,33 @@ For long-running tasks (benchmarks, test suites, builds), write progress to your
 
 Some agents (e.g. Gemini) are sandboxed to their workspace. Project-local `.dead-drop/` is accessible to all agents working in the repo.
 
+## Roles
+
+Four roles define what agents do. Any model can fill any role.
+
+| Role | Lifecycle | Function |
+|------|-----------|----------|
+| `lead` | Persistent | Coordinates, reviews, routes tasks |
+| `researcher` | Persistent | Reads source, finds bugs, writes analysis |
+| `coder` | Ephemeral | Writes code from specific instructions |
+| `builder` | Ephemeral | Builds, runs tests, executes commands |
+
+**Detailed role profiles:** `docs/roles/` in the repo, deployed to `~/.dead-drop/roles/` by `scripts/install.sh`.
+
+Agents receive their role profile automatically in the `register()` response — no file reads needed.
+
+Each profile covers: responsibility, input/output, communication rules, and boundaries.
+
 ## Agent Routing
 
-`claude-lead` (Opus) is the router. All agents report to `claude-lead`. The human manages one window.
+The lead agent is the router. All other agents report to lead. The human manages one window.
 
-| Agent | Model | Lifecycle | Task Type |
-|-------|-------|-----------|-----------|
-| `claude-lead` | Opus | Persistent (main session) | Coordination, review, decisions |
-| `gemini-benchmarker` | Gemini Flash | Persistent (separate terminal) | Research, Google search, code analysis |
-| `haiku-builder` | Haiku | Ephemeral (spawned per task) | Build, run tests, grep output |
-
-### Haiku spawn pattern
-1. Send task to `haiku-builder` via dead-drop
-2. Spawn Haiku background agent: register, check inbox, execute, report back
-3. Haiku dies after task. Next task = new spawn.
+### Ephemeral agent spawn pattern
+1. Lead pre-registers the agent slot (name, role)
+2. Lead sends task message to the agent name via dead-drop
+3. Lead spawns the agent — agent re-registers (gets onboarding), checks inbox, finds task waiting
+4. Agent executes, reports back via dead-drop, dies
+5. Slot stays registered. Next task = new spawn into same slot.
 
 ### Queuing discipline
 - One task per message per agent. Wait for completion before sending next.

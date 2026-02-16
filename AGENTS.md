@@ -25,12 +25,14 @@ Any AI coding tool that supports MCP can participate: Claude Code, Codex CLI, Op
 
 Roles describe function, not which AI model runs them. Any model can fill any role.
 
-| Role | Function | Lifecycle |
-|------|----------|-----------|
-| `lead` | Coordinates, reviews, routes tasks | Persistent |
-| `researcher` | Reads source, finds bugs, writes analysis | Persistent |
-| `coder` | Writes code from specific instructions | Ephemeral |
-| `builder` | Builds, runs tests, executes commands | Ephemeral |
+| Role | Function | Lifecycle | Profile |
+|------|----------|-----------|---------|
+| `lead` | Coordinates, reviews, routes tasks | Persistent | [`docs/roles/lead.md`](docs/roles/lead.md) |
+| `researcher` | Reads source, finds bugs, writes analysis | Persistent | [`docs/roles/researcher.md`](docs/roles/researcher.md) |
+| `coder` | Writes code from specific instructions | Ephemeral | [`docs/roles/coder.md`](docs/roles/coder.md) |
+| `builder` | Builds, runs tests, executes commands | Ephemeral | [`docs/roles/builder.md`](docs/roles/builder.md) |
+
+Role profiles are deployed to `~/.dead-drop/roles/` by `scripts/install.sh`.
 
 ## Naming Convention
 

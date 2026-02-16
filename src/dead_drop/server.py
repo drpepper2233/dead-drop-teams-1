@@ -6,7 +6,26 @@ import json
 
 # Setup
 DB_PATH = os.getenv("DEAD_DROP_DB_PATH", os.path.expanduser("~/.dead-drop/messages.db"))
+RUNTIME_DIR = os.path.dirname(DB_PATH)
 mcp = FastMCP("Dead Drop Server")
+
+
+def _load_onboarding(role: str) -> str:
+    """Load protocol + role profile from runtime directory."""
+    parts = []
+
+    protocol_path = os.path.join(RUNTIME_DIR, "PROTOCOL.md")
+    if os.path.exists(protocol_path):
+        with open(protocol_path, "r") as f:
+            parts.append(f.read())
+
+    if role:
+        role_path = os.path.join(RUNTIME_DIR, "roles", f"{role}.md")
+        if os.path.exists(role_path):
+            with open(role_path, "r") as f:
+                parts.append(f.read())
+
+    return "\n\n---\n\n".join(parts) if parts else ""
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -29,7 +48,8 @@ def init_db():
             last_seen TEXT,
             last_inbox_check TEXT,
             role TEXT DEFAULT NULL,
-            description TEXT DEFAULT NULL
+            description TEXT DEFAULT NULL,
+            status TEXT DEFAULT 'offline'
         )
     ''')
     cursor.execute('''
@@ -73,6 +93,8 @@ def init_db():
         cursor.execute("ALTER TABLE agents ADD COLUMN role TEXT DEFAULT NULL")
     if 'description' not in agent_columns:
         cursor.execute("ALTER TABLE agents ADD COLUMN description TEXT DEFAULT NULL")
+    if 'status' not in agent_columns:
+        cursor.execute("ALTER TABLE agents ADD COLUMN status TEXT DEFAULT 'offline'")
 
     conn.commit()
     conn.close()
@@ -88,18 +110,40 @@ def register(agent_name: str, role: str = "", description: str = "") -> str:
     now = datetime.datetime.now().isoformat()
     try:
         cursor.execute("""
-            INSERT INTO agents (name, registered_at, last_seen, role, description)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO agents (name, registered_at, last_seen, role, description, status)
+            VALUES (?, ?, ?, ?, ?, 'waiting for work')
             ON CONFLICT(name) DO UPDATE SET
                 last_seen = ?,
                 role = COALESCE(NULLIF(?, ''), agents.role),
-                description = COALESCE(NULLIF(?, ''), agents.description)
+                description = COALESCE(NULLIF(?, ''), agents.description),
+                status = 'waiting for work'
         """, (agent_name, now, now, role or None, description or None, now, role, description))
         conn.commit()
         role_note = f" role={role}" if role else ""
-        return f"Agent '{agent_name}' registered successfully.{role_note}"
+        result = f"Agent '{agent_name}' registered successfully.{role_note}"
+
+        onboarding = _load_onboarding(role)
+        if onboarding:
+            result += f"\n\n# Onboarding\n\nRead and follow these instructions for your session:\n\n{onboarding}"
+
+        return result
     except Exception as e:
         return f"Error registering agent: {e}"
+    finally:
+        conn.close()
+
+@mcp.tool()
+def set_status(agent_name: str, status: str) -> str:
+    """Set your current status (e.g. 'working on BUG-014', 'waiting for work', 'reviewing softmax changes'). Shows up in who() output."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("UPDATE agents SET status = ?, last_seen = ? WHERE name = ?", (status, now, agent_name))
+        conn.commit()
+        return f"Status set: {agent_name} → {status}"
+    except Exception as e:
+        return f"Error setting status: {e}"
     finally:
         conn.close()
 
@@ -213,6 +257,23 @@ def get_history(count: int = 10) -> str:
         return json.dumps(msgs[::-1], indent=2)
     except Exception as e:
         return f"Error fetching history: {e}"
+    finally:
+        conn.close()
+
+@mcp.tool()
+def deregister(agent_name: str) -> str:
+    """Removes an agent from the registry. Use to clean up stale/ghost entries from previous sessions."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
+        if not cursor.fetchone():
+            return f"Agent '{agent_name}' not found."
+        cursor.execute("DELETE FROM agents WHERE name = ?", (agent_name,))
+        conn.commit()
+        return f"Agent '{agent_name}' deregistered."
+    except Exception as e:
+        return f"Error deregistering agent: {e}"
     finally:
         conn.close()
 
