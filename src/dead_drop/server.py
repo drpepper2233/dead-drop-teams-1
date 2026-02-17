@@ -168,7 +168,60 @@ def init_db():
             PRIMARY KEY (agent_name, message_id)
         )
     ''')
-    # Migrations
+    # Phase 1: Tasks
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            project TEXT DEFAULT '',
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            assigned_to TEXT,
+            created_by TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+                CHECK(status IN ('pending','assigned','in_progress','review','completed','failed')),
+            result TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+    ''')
+    # Phase 2: Handshakes
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS handshakes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            initiated_by TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+                CHECK(status IN ('pending','completed'))
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS handshake_acks (
+            handshake_id INTEGER,
+            agent_name TEXT,
+            acked_at TEXT NOT NULL,
+            PRIMARY KEY (handshake_id, agent_name)
+        )
+    ''')
+    # Phase 5: Interface contracts
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT DEFAULT '',
+            name TEXT NOT NULL,
+            type TEXT NOT NULL
+                CHECK(type IN ('function','dom_id','css_class','file_path','api_endpoint','event','other')),
+            owner TEXT NOT NULL,
+            spec TEXT DEFAULT '',
+            version INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project, name, type)
+        )
+    ''')
+
+    # Migrations — agents
     cursor.execute("PRAGMA table_info(agents)")
     cols = [c[1] for c in cursor.fetchall()]
     if 'last_inbox_check' not in cols:
@@ -179,13 +232,20 @@ def init_db():
         cursor.execute("ALTER TABLE agents ADD COLUMN description TEXT DEFAULT NULL")
     if 'status' not in cols:
         cursor.execute("ALTER TABLE agents ADD COLUMN status TEXT DEFAULT 'offline'")
+    if 'heartbeat_at' not in cols:
+        cursor.execute("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL")
 
+    # Migrations — messages
     cursor.execute("PRAGMA table_info(messages)")
     mcols = [c[1] for c in cursor.fetchall()]
     if 'is_cc' not in mcols:
         cursor.execute("ALTER TABLE messages ADD COLUMN is_cc INTEGER DEFAULT 0")
     if 'cc_original_to' not in mcols:
         cursor.execute("ALTER TABLE messages ADD COLUMN cc_original_to TEXT DEFAULT NULL")
+    if 'task_id' not in mcols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN task_id TEXT DEFAULT NULL")
+    if 'reply_to' not in mcols:
+        cursor.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL")
 
     conn.commit()
     conn.close()
@@ -246,8 +306,8 @@ async def set_status(agent_name: str, status: str) -> str:
 
 
 @mcp.tool()
-async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: str = "") -> str:
-    """Sends a message to a specific agent name, or 'all' for broadcast. Optional cc param for carbon-copying another agent."""
+async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: str = "", task_id: str = "", reply_to: int = 0) -> str:
+    """Sends a message to a specific agent name, or 'all' for broadcast. Optional: cc (carbon-copy), task_id (link to task), reply_to (message ID to reply to)."""
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
@@ -272,8 +332,20 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
         if from_agent not in _agent_sessions:
             await _register_session(from_agent, ctx.session)
 
+        # Auto-inherit task_id from reply_to message if not explicitly set
+        effective_task_id = task_id or None
+        effective_reply_to = reply_to if reply_to else None
+        if effective_reply_to and not effective_task_id:
+            cursor.execute("SELECT task_id FROM messages WHERE id = ?", (effective_reply_to,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                effective_task_id = row[0]
+
         # Insert primary message
-        cursor.execute("INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc) VALUES (?, ?, ?, ?, 0, 0)", (from_agent, to_agent, message, now))
+        cursor.execute(
+            "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id, reply_to) VALUES (?, ?, ?, ?, 0, 0, ?, ?)",
+            (from_agent, to_agent, message, now, effective_task_id, effective_reply_to)
+        )
 
         # Build CC list: explicit + auto-CC lead
         cc_agents = [a.strip() for a in cc.split(",") if a.strip()] if cc else []
@@ -283,7 +355,10 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
 
         for cc_agent in cc_agents:
             if cc_agent != to_agent:
-                cursor.execute("INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to) VALUES (?, ?, ?, ?, 0, 1, ?)", (from_agent, cc_agent, message, now, to_agent))
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to, task_id, reply_to) VALUES (?, ?, ?, ?, 0, 1, ?, ?, ?)",
+                    (from_agent, cc_agent, message, now, to_agent, effective_task_id, effective_reply_to)
+                )
 
         conn.commit()
 
@@ -300,7 +375,8 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
         await _notify_agents(notify_targets)
 
         cc_note = f" (cc: {cc})" if cc else ""
-        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}."
+        task_note = f" [task: {effective_task_id}]" if effective_task_id else ""
+        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}{task_note}."
     except Exception as e:
         return f"Error sending message: {e}"
     finally:
@@ -351,12 +427,15 @@ async def check_inbox(agent_name: str, ctx: Context) -> str:
 
 
 @mcp.tool()
-async def get_history(count: int = 10) -> str:
-    """Returns the last N messages across all agents (for catch-up)."""
+async def get_history(count: int = 10, task_id: str = "") -> str:
+    """Returns the last N messages across all agents (for catch-up). Optional task_id filter for threaded conversation."""
     conn = get_db()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * FROM messages ORDER BY timestamp DESC LIMIT ?", (count,))
+        if task_id:
+            cursor.execute("SELECT * FROM messages WHERE task_id = ? ORDER BY timestamp DESC LIMIT ?", (task_id, count))
+        else:
+            cursor.execute("SELECT * FROM messages ORDER BY timestamp DESC LIMIT ?", (count,))
         msgs = [dict(row) for row in cursor.fetchall()]
         return json.dumps(msgs[::-1], indent=2)
     except Exception as e:
@@ -386,17 +465,600 @@ async def deregister(agent_name: str) -> str:
 
 @mcp.tool()
 async def who() -> str:
-    """Lists all registered agents and when they last checked in."""
+    """Lists all registered agents with connection status and health. Health: healthy (<2m), stale (<10m), dead (>=10m), unknown (no heartbeat)."""
     conn = get_db()
     cursor = conn.cursor()
+    now_dt = datetime.datetime.now()
     try:
         cursor.execute("SELECT * FROM agents ORDER BY last_seen DESC")
         agents = [dict(row) for row in cursor.fetchall()]
         for agent in agents:
             agent['connected'] = agent['name'] in _agent_sessions
+            # Compute health from heartbeat
+            hb = agent.get('heartbeat_at')
+            if hb:
+                try:
+                    last_hb = datetime.datetime.fromisoformat(hb)
+                    delta = (now_dt - last_hb).total_seconds()
+                    if delta < 120:
+                        agent['health'] = 'healthy'
+                    elif delta < 600:
+                        agent['health'] = 'stale'
+                    else:
+                        agent['health'] = 'dead'
+                except (ValueError, TypeError):
+                    agent['health'] = 'unknown'
+            else:
+                agent['health'] = 'unknown'
         return json.dumps(agents, indent=2)
     except Exception as e:
         return f"Error listing agents: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 1: Task State Machine ───────────────────────────────────────
+
+def _next_task_id(cursor):
+    """Generate next TASK-NNN id."""
+    cursor.execute("SELECT id FROM tasks ORDER BY CAST(SUBSTR(id, 6) AS INTEGER) DESC LIMIT 1")
+    row = cursor.fetchone()
+    if row:
+        num = int(row[0].split("-")[1]) + 1
+    else:
+        num = 1
+    return f"TASK-{num:03d}"
+
+
+# Valid state transitions: (from_status, to_status) -> who can do it
+_TASK_TRANSITIONS = {
+    ("pending", "assigned"): "lead",
+    ("assigned", "in_progress"): "assignee",
+    ("in_progress", "review"): "assignee",
+    ("in_progress", "failed"): "assignee",
+    ("review", "completed"): "lead",
+    ("review", "in_progress"): "lead",  # rework
+    ("failed", "assigned"): "lead",     # retry/reassign
+}
+
+
+@mcp.tool()
+async def create_task(creator: str, title: str, ctx: Context, description: str = "", assign_to: str = "", project: str = "") -> str:
+    """Create a task. Optionally assign it immediately. Returns task ID. Auto-sends assignment message if assigned."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        task_id = _next_task_id(cursor)
+        status = "assigned" if assign_to else "pending"
+        cursor.execute(
+            "INSERT INTO tasks (id, project, title, description, assigned_to, created_by, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, project, title, description, assign_to or None, creator, status, now, now)
+        )
+        conn.commit()
+
+        result = f"Task {task_id} created: '{title}' (status: {status})"
+
+        # Auto-send assignment message
+        if assign_to:
+            msg = f"[{task_id}] TASK ASSIGNED: {title}"
+            if description:
+                msg += f"\n\n{description}"
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (creator, assign_to, msg, now, task_id)
+            )
+            # CC lead if creator isn't lead
+            lead_name = _get_lead(cursor)
+            if lead_name and creator != lead_name and assign_to != lead_name:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to, task_id) VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
+                    (creator, lead_name, msg, now, assign_to, task_id)
+                )
+            conn.commit()
+            await _notify_agent(assign_to)
+            if lead_name and creator != lead_name and assign_to != lead_name:
+                await _notify_agent(lead_name)
+            result += f" → assigned to {assign_to}"
+
+        return result
+    except Exception as e:
+        return f"Error creating task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def update_task(agent_name: str, task_id: str, status: str, ctx: Context, result: str = "") -> str:
+    """Transition a task's status. Enforces valid transitions. Lead can: assign, approve, reject, reassign. Assignee can: start, submit for review, fail."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+        old_status = task["status"]
+        transition = (old_status, status)
+
+        if transition not in _TASK_TRANSITIONS:
+            valid = [t[1] for t in _TASK_TRANSITIONS if t[0] == old_status]
+            return f"Invalid transition: {old_status} → {status}. Valid: {', '.join(valid) if valid else 'none (terminal state)'}"
+
+        required_role = _TASK_TRANSITIONS[transition]
+        lead_name = _get_lead(cursor)
+
+        if required_role == "lead" and agent_name != lead_name:
+            return f"Only the lead ({lead_name}) can transition {old_status} → {status}."
+        if required_role == "assignee" and agent_name != task["assigned_to"]:
+            return f"Only the assigned agent ({task['assigned_to']}) can transition {old_status} → {status}."
+
+        # Handle assignment — allow reassigning on failed→assigned
+        update_fields = "status = ?, updated_at = ?"
+        params = [status, now]
+        if result:
+            update_fields += ", result = ?"
+            params.append(result)
+        if status == "completed":
+            update_fields += ", completed_at = ?"
+            params.append(now)
+        params.append(task_id)
+        cursor.execute(f"UPDATE tasks SET {update_fields} WHERE id = ?", params)
+
+        # Auto-notify relevant parties
+        notify_targets = []
+        msg = f"[{task_id}] Status: {old_status} → {status}"
+        if result:
+            msg += f"\n\n{result}"
+
+        if required_role == "assignee" and lead_name:
+            # Assignee changed status → notify lead
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, lead_name, msg, now, task_id)
+            )
+            notify_targets.append(lead_name)
+        elif required_role == "lead" and task["assigned_to"]:
+            # Lead changed status → notify assignee
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, task["assigned_to"], msg, now, task_id)
+            )
+            notify_targets.append(task["assigned_to"])
+
+        conn.commit()
+        await _notify_agents(notify_targets)
+
+        return f"Task {task_id}: {old_status} → {status}"
+    except Exception as e:
+        return f"Error updating task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def list_tasks(status: str = "", assigned_to: str = "", project: str = "") -> str:
+    """List tasks. Filter by status, assigned_to, project. Default: all non-completed tasks. Includes health warning for dead agents."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now_dt = datetime.datetime.now()
+    try:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        elif not assigned_to and not project:
+            query += " AND status NOT IN ('completed')"
+        if assigned_to:
+            query += " AND assigned_to = ?"
+            params.append(assigned_to)
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        query += " ORDER BY created_at ASC"
+
+        cursor.execute(query, params)
+        tasks = [dict(row) for row in cursor.fetchall()]
+
+        # Add health warnings for in-progress tasks with dead agents
+        for task in tasks:
+            if task["status"] == "in_progress" and task["assigned_to"]:
+                cursor.execute("SELECT heartbeat_at FROM agents WHERE name = ?", (task["assigned_to"],))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    try:
+                        last_hb = datetime.datetime.fromisoformat(row[0])
+                        if (now_dt - last_hb).total_seconds() >= 600:
+                            task["warning"] = "assigned agent appears dead"
+                    except (ValueError, TypeError):
+                        pass
+
+        return json.dumps(tasks, indent=2)
+    except Exception as e:
+        return f"Error listing tasks: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 2: Handshake ACK ───────────────────────────────────────────
+
+@mcp.tool()
+async def initiate_handshake(from_agent: str, message: str, ctx: Context, agents: str = "") -> str:
+    """Lead broadcasts a neural handshake plan. All target agents must ACK before GO. Returns handshake ID. Agents param: comma-separated names, or empty for all non-lead agents."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify lead
+        lead_name = _get_lead(cursor)
+        if lead_name and from_agent != lead_name:
+            return f"Only the lead ({lead_name}) can initiate handshakes."
+
+        # Determine target agents
+        if agents:
+            target_agents = [a.strip() for a in agents.split(",") if a.strip()]
+        else:
+            cursor.execute("SELECT name FROM agents WHERE name != ?", (from_agent,))
+            target_agents = [row[0] for row in cursor.fetchall()]
+
+        if not target_agents:
+            return "No agents to handshake with. Register agents first."
+
+        # Broadcast the handshake message
+        handshake_prefix = "[HANDSHAKE] "
+        full_message = handshake_prefix + message
+
+        # Send to each target agent individually (not broadcast) so we can track delivery
+        msg_id = None
+        for agent in target_agents:
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, NULL)",
+                (from_agent, agent, full_message, now)
+            )
+            if msg_id is None:
+                msg_id = cursor.lastrowid
+
+        # Create handshake record
+        cursor.execute(
+            "INSERT INTO handshakes (initiated_by, message_id, created_at, status) VALUES (?, ?, ?, 'pending')",
+            (from_agent, msg_id, now)
+        )
+        handshake_id = cursor.lastrowid
+        conn.commit()
+
+        # Push notify all targets
+        await _notify_agents(target_agents)
+
+        agent_list = ", ".join(target_agents)
+        return f"Handshake #{handshake_id} initiated. Waiting for ACK from: {agent_list}. Agents: call ack_handshake(agent_name, handshake_id={handshake_id}) after reading the plan."
+    except Exception as e:
+        return f"Error initiating handshake: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def ack_handshake(agent_name: str, handshake_id: int, ctx: Context) -> str:
+    """Acknowledge a neural handshake. Call this after reading the plan to confirm you understand it."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify handshake exists and is pending
+        cursor.execute("SELECT * FROM handshakes WHERE id = ?", (handshake_id,))
+        hs = cursor.fetchone()
+        if not hs:
+            return f"Handshake #{handshake_id} not found."
+        hs = dict(hs)
+        if hs["status"] == "completed":
+            return f"Handshake #{handshake_id} is already completed."
+
+        # Check if already acked
+        cursor.execute("SELECT * FROM handshake_acks WHERE handshake_id = ? AND agent_name = ?", (handshake_id, agent_name))
+        if cursor.fetchone():
+            return f"You already ACKed handshake #{handshake_id}."
+
+        # Record the ACK
+        cursor.execute("INSERT INTO handshake_acks (handshake_id, agent_name, acked_at) VALUES (?, ?, ?)", (handshake_id, agent_name, now))
+
+        # Check if all agents have acked
+        cursor.execute("SELECT name FROM agents WHERE name != ?", (hs["initiated_by"],))
+        all_agents = {row[0] for row in cursor.fetchall()}
+        cursor.execute("SELECT agent_name FROM handshake_acks WHERE handshake_id = ?", (handshake_id,))
+        acked_agents = {row[0] for row in cursor.fetchall()}
+        pending = all_agents - acked_agents
+
+        if not pending:
+            cursor.execute("UPDATE handshakes SET status = 'completed' WHERE id = ?", (handshake_id,))
+            conn.commit()
+            # Notify lead that all agents are synced
+            lead_name = hs["initiated_by"]
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc) VALUES (?, ?, ?, ?, 0, 0)",
+                ("system", lead_name, f"[HANDSHAKE #{handshake_id}] ALL AGENTS SYNCED. Ready for GO signal.", now)
+            )
+            conn.commit()
+            await _notify_agent(lead_name)
+            return f"ACK recorded. Handshake #{handshake_id} COMPLETE — all agents synced!"
+        else:
+            conn.commit()
+            return f"ACK recorded. Still waiting on: {', '.join(pending)}"
+    except Exception as e:
+        return f"Error acknowledging handshake: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def handshake_status(handshake_id: int) -> str:
+    """Check status of a neural handshake. Shows who has ACKed and who is still pending."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM handshakes WHERE id = ?", (handshake_id,))
+        hs = cursor.fetchone()
+        if not hs:
+            return f"Handshake #{handshake_id} not found."
+        hs = dict(hs)
+
+        cursor.execute("SELECT agent_name, acked_at FROM handshake_acks WHERE handshake_id = ?", (handshake_id,))
+        acks = [{"agent": row[0], "acked_at": row[1]} for row in cursor.fetchall()]
+        acked_names = {a["agent"] for a in acks}
+
+        cursor.execute("SELECT name FROM agents WHERE name != ?", (hs["initiated_by"],))
+        all_agents = {row[0] for row in cursor.fetchall()}
+        pending = list(all_agents - acked_names)
+
+        result = {
+            "handshake_id": hs["id"],
+            "initiated_by": hs["initiated_by"],
+            "status": hs["status"],
+            "created_at": hs["created_at"],
+            "acked": acks,
+            "pending": pending,
+        }
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error checking handshake status: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 3: Agent Health ────────────────────────────────────────────
+
+@mcp.tool()
+async def ping(agent_name: str, ctx: Context) -> str:
+    """Lightweight heartbeat. Call periodically (every 60s recommended) to signal liveness. Updates health status in who()."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("UPDATE agents SET heartbeat_at = ?, last_seen = ? WHERE name = ?", (now, now, agent_name))
+        conn.commit()
+        # Re-register session if needed
+        if agent_name not in _agent_sessions:
+            await _register_session(agent_name, ctx.session)
+        return f"pong — {now}"
+    except Exception as e:
+        return f"Error: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 4: Review Gates ────────────────────────────────────────────
+
+@mcp.tool()
+async def submit_for_review(agent_name: str, task_id: str, summary: str, ctx: Context, files_changed: str = "", test_results: str = "") -> str:
+    """Submit a task for lead review. Transitions task to 'review' and sends structured review message to lead."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+        if task["status"] != "in_progress":
+            return f"Task {task_id} is '{task['status']}', must be 'in_progress' to submit for review."
+        if task["assigned_to"] != agent_name:
+            return f"Task {task_id} is assigned to '{task['assigned_to']}', not you."
+
+        # Build result JSON
+        review_data = json.dumps({
+            "summary": summary,
+            "files_changed": files_changed,
+            "test_results": test_results,
+        })
+        cursor.execute("UPDATE tasks SET status = 'review', result = ?, updated_at = ? WHERE id = ?", (review_data, now, task_id))
+
+        # Send structured review message to lead
+        lead_name = _get_lead(cursor)
+        if lead_name:
+            msg = f"[REVIEW] {task_id}: {task['title']}\n\nSUMMARY: {summary}"
+            if files_changed:
+                msg += f"\nFILES: {files_changed}"
+            if test_results:
+                msg += f"\nTESTS: {test_results}"
+            msg += f"\n\nAwaiting review. Use approve_task or reject_task."
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, lead_name, msg, now, task_id)
+            )
+            conn.commit()
+            await _notify_agent(lead_name)
+        else:
+            conn.commit()
+
+        return f"Task {task_id} submitted for review."
+    except Exception as e:
+        return f"Error submitting for review: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def approve_task(agent_name: str, task_id: str, ctx: Context, notes: str = "") -> str:
+    """Lead approves a task in review. Transitions to 'completed' and notifies the assignee."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        lead_name = _get_lead(cursor)
+        if lead_name and agent_name != lead_name:
+            return f"Only the lead ({lead_name}) can approve tasks."
+
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+        if task["status"] != "review":
+            return f"Task {task_id} is '{task['status']}', must be 'review' to approve."
+
+        cursor.execute("UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", (now, now, task_id))
+
+        # Notify assignee
+        if task["assigned_to"]:
+            msg = f"[APPROVED] {task_id}: {task['title']}"
+            if notes:
+                msg += f"\n\nNotes: {notes}"
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, task["assigned_to"], msg, now, task_id)
+            )
+            conn.commit()
+            await _notify_agent(task["assigned_to"])
+        else:
+            conn.commit()
+
+        return f"Task {task_id} approved and completed."
+    except Exception as e:
+        return f"Error approving task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def reject_task(agent_name: str, task_id: str, reason: str, ctx: Context) -> str:
+    """Lead rejects a task in review. Sends it back to 'in_progress' for rework with feedback."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        lead_name = _get_lead(cursor)
+        if lead_name and agent_name != lead_name:
+            return f"Only the lead ({lead_name}) can reject tasks."
+
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+        if task["status"] != "review":
+            return f"Task {task_id} is '{task['status']}', must be 'review' to reject."
+
+        cursor.execute("UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?", (now, task_id))
+
+        # Notify assignee with rework feedback
+        if task["assigned_to"]:
+            msg = f"[REWORK] {task_id}: {task['title']}\n\nREASON: {reason}"
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, task["assigned_to"], msg, now, task_id)
+            )
+            conn.commit()
+            await _notify_agent(task["assigned_to"])
+        else:
+            conn.commit()
+
+        return f"Task {task_id} rejected — sent back to {task['assigned_to']} for rework."
+    except Exception as e:
+        return f"Error rejecting task: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 5: Interface Contracts ─────────────────────────────────────
+
+@mcp.tool()
+async def declare_contract(agent_name: str, name: str, type: str, spec: str, ctx: Context, project: str = "") -> str:
+    """Declare or update a shared interface contract. Types: function, dom_id, css_class, file_path, api_endpoint, event, other. Auto-broadcasts on version bump."""
+    valid_types = ('function', 'dom_id', 'css_class', 'file_path', 'api_endpoint', 'event', 'other')
+    if type not in valid_types:
+        return f"Invalid type '{type}'. Must be one of: {', '.join(valid_types)}"
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Check if exists
+        cursor.execute("SELECT * FROM contracts WHERE project = ? AND name = ? AND type = ?", (project, name, type))
+        existing = cursor.fetchone()
+
+        if existing:
+            existing = dict(existing)
+            new_version = existing["version"] + 1
+            cursor.execute(
+                "UPDATE contracts SET spec = ?, owner = ?, version = ?, updated_at = ? WHERE id = ?",
+                (spec, agent_name, new_version, now, existing["id"])
+            )
+            conn.commit()
+
+            # Auto-broadcast version change
+            msg = f"[CONTRACT v{new_version}] {type} '{name}' updated by {agent_name}: {spec}"
+            # Send to all registered agents except self
+            cursor.execute("SELECT name FROM agents WHERE name != ?", (agent_name,))
+            targets = [row[0] for row in cursor.fetchall()]
+            for target in targets:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc) VALUES (?, ?, ?, ?, 0, 0)",
+                    (agent_name, target, msg, now)
+                )
+            conn.commit()
+            await _notify_agents(targets)
+
+            return f"Contract updated: {type} '{name}' v{new_version} (owner: {agent_name})"
+        else:
+            cursor.execute(
+                "INSERT INTO contracts (project, name, type, owner, spec, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (project, name, type, agent_name, spec, now, now)
+            )
+            conn.commit()
+            return f"Contract declared: {type} '{name}' v1 (owner: {agent_name})"
+    except Exception as e:
+        return f"Error declaring contract: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def list_contracts(project: str = "", owner: str = "", type: str = "") -> str:
+    """List declared interface contracts. Filter by project, owner, type."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        query = "SELECT * FROM contracts WHERE 1=1"
+        params = []
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+        if owner:
+            query += " AND owner = ?"
+            params.append(owner)
+        if type:
+            query += " AND type = ?"
+            params.append(type)
+        query += " ORDER BY type, name"
+
+        cursor.execute(query, params)
+        contracts = [dict(row) for row in cursor.fetchall()]
+        return json.dumps(contracts, indent=2)
+    except Exception as e:
+        return f"Error listing contracts: {e}"
     finally:
         conn.close()
 

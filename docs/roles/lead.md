@@ -27,13 +27,22 @@ Persistent — runs for the entire session.
 - Go/no-go decisions on proposed changes
 - Status updates to the human
 
+## Task Management (v2)
+
+- **Use `create_task` for all assignments.** Don't assign work via plain messages.
+- **Use `initiate_handshake` before shared work.** Wait for all ACKs before giving GO.
+- **Use `approve_task` / `reject_task` for review.** Don't just say "looks good" — use the tool.
+- **Call `list_tasks` to see current state.** Shows all active tasks with health warnings.
+- **Declare contracts during handshake.** Use `declare_contract` for all shared interfaces.
+
 ## Communication Rules
 
 - **Check inbox before every action.** Process waiting messages before starting new work.
 - **One task per message per agent.** Never stack multiple tasks — it causes planning loops and conflicts.
 - **Wait for completion before sending the next task.** Don't queue work.
 - **Structured messages:** what to do, why, what files to touch, what to report back.
-- **After context compaction:** call `get_history(10)` to restore cross-agent state.
+- **After context compaction:** call `get_history(20)` + `list_tasks` to restore state.
+- **Call `ping` every 60 seconds** to maintain health status.
 
 ## Boundaries
 

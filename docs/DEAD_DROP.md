@@ -71,22 +71,66 @@ Claude Code surfaces completed task → you see alert → call check_inbox → r
 
 ## Tools
 
+### Core Messaging
 | Tool | Usage |
 |------|-------|
 | `register` | `(agent_name, role, description)` — register on connect |
-| `send` | `(from_agent, to_agent, message)` — send message |
+| `send` | `(from_agent, to_agent, message, cc?, task_id?, reply_to?)` — send message (task_id/reply_to for threading) |
 | `check_inbox` | `(agent_name)` — read unread messages |
-| `who` | `()` — list online agents |
-| `get_history` | `(count)` — last N messages |
+| `who` | `()` — list agents + health status (healthy/stale/dead) |
+| `get_history` | `(count, task_id?)` — last N messages, filter by task for threaded view |
 | `set_status` | `(agent_name, status)` — update your status |
 | `deregister` | `(agent_name)` — remove yourself |
+
+### Task Management
+| Tool | Usage |
+|------|-------|
+| `create_task` | `(creator, title, description?, assign_to?, project?)` — create and assign tasks |
+| `update_task` | `(agent_name, task_id, status, result?)` — transition task state (enforced) |
+| `list_tasks` | `(status?, assigned_to?, project?)` — query tasks with health warnings |
+
+### Neural Handshake
+| Tool | Usage |
+|------|-------|
+| `initiate_handshake` | `(from_agent, message, agents?)` — broadcast plan, require ACKs |
+| `ack_handshake` | `(agent_name, handshake_id)` — confirm receipt of plan |
+| `handshake_status` | `(handshake_id)` — check who has ACKed |
+
+### Health & Review
+| Tool | Usage |
+|------|-------|
+| `ping` | `(agent_name)` — heartbeat, call every 60s |
+| `submit_for_review` | `(agent_name, task_id, summary, files_changed?, test_results?)` — submit work for lead review |
+| `approve_task` | `(agent_name, task_id, notes?)` — lead approves → completed |
+| `reject_task` | `(agent_name, task_id, reason)` — lead rejects → rework |
+
+### Interface Contracts
+| Tool | Usage |
+|------|-------|
+| `declare_contract` | `(agent_name, name, type, spec, project?)` — register shared interface |
+| `list_contracts` | `(project?, owner?, type?)` — query declared interfaces |
+
+## Task Lifecycle (Server-Enforced)
+
+```
+pending → assigned → in_progress → review → completed
+                ↑          |            |
+                └── failed ←────────────┘ (rework)
+```
+
+- **Lead can:** assign, approve, reject/rework, retry failed
+- **Assignee can:** start work, submit for review, report failure
 
 ## Rules
 
 - MUST call `check_inbox` before `send` (server enforces this)
 - NEVER use sqlite3 directly — always use the MCP tools
 - Lead (juno) is auto-CC'd on all messages
-- One task per message per agent
+- Use `create_task` for all work assignments (not plain messages)
+- Use `submit_for_review` when done (not just "done" messages)
+- ACK handshakes before starting work
+- Call `ping` every 60s (persistent agents)
+- Declare shared interfaces with `declare_contract` during handshake
 - For long tasks, write progress to `.dead-drop/<your-name>/<task>.log`
 
 ## The Drift — Collaboration Protocol
@@ -94,7 +138,13 @@ Claude Code surfaces completed task → you see alert → call check_inbox → r
 Inspired by the neural bridge ("The Drift") from Pacific Rim. Two Jaeger pilots share one mind — each controls half the body, perfectly synchronized. One pilot can't carry the neural load alone. Neither can one agent carry a whole project alone. We drift.
 
 ### Neural Handshake (Sync Before Work)
-Before starting any shared task, agents establish a **neural handshake**: juno sends the task breakdown with shared context — the project goal, file structure, interfaces, naming conventions, and who owns what. Every agent must have the same mental model before building begins. No one starts until everyone is synced.
+Before starting any shared task, agents establish a **neural handshake**:
+1. juno calls `initiate_handshake(message="...plan...")` with the task breakdown, interfaces, and ownership
+2. Each agent reads the plan via `check_inbox`, then calls `ack_handshake(handshake_id=N)`
+3. juno calls `handshake_status(N)` — GO signal only after all agents ACK
+4. juno declares shared interfaces with `declare_contract` (DOM IDs, function sigs, API endpoints)
+
+Every agent must have the same mental model before building begins. No one starts until everyone is synced.
 
 ### Hemisphere Split (Left Brain / Right Brain)
 Each agent owns a **hemisphere** — a distinct half of the system. Like Jaeger pilots where one controls the left side and the other controls the right, agents split by concern, not by sequence:
@@ -112,8 +162,9 @@ If you see another agent's name on a file, **don't touch it** without messaging 
 
 ### Shared Memory (The Drift State)
 Agents share state through the project files themselves — the codebase IS the shared memory. When you write a file, you're writing to the shared brain. Rules:
-- **Declare interfaces up front.** DOM IDs, function signatures, file paths — agreed on during the handshake.
-- **Never silently change a shared interface.** If you rename an ID or change a function signature, IMMEDIATELY notify your co-pilot.
+- **Declare interfaces with `declare_contract`.** DOM IDs, function signatures, file paths — registered in the contract registry during the handshake.
+- **Never silently change a shared interface.** Use `declare_contract` to update (auto-broadcasts version change to all agents).
+- **Check contracts before integrating.** Call `list_contracts` to see the current interface surface.
 - **Read before you wire.** When integrating your co-pilot's work, read their actual code — don't assume.
 
 ### Don't Chase the Rabbit
