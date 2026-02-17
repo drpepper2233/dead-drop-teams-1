@@ -323,7 +323,14 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
     now = datetime.datetime.now().isoformat()
     try:
         # Check for unread messages before allowing send
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE to_agent = ? AND read_flag = 0", (from_agent,))
+        # Match both short name and team-scoped name
+        cursor.execute("SELECT team FROM agents WHERE name = ?", (from_agent,))
+        _team_row = cursor.fetchone()
+        from_variants = [from_agent]
+        if _team_row and _team_row[0]:
+            from_variants.append(f"{_team_row[0]}/{from_agent}")
+        _ph = ','.join(['?'] * len(from_variants))
+        cursor.execute(f"SELECT COUNT(*) FROM messages WHERE to_agent IN ({_ph}) AND read_flag = 0", from_variants)
         unread_direct = cursor.fetchone()[0]
         cursor.execute("""
             SELECT COUNT(*) FROM messages
@@ -424,7 +431,15 @@ async def check_inbox(agent_name: str, ctx: Context) -> str:
 
         cursor.execute("UPDATE agents SET last_seen = ?, last_inbox_check = ? WHERE name = ?", (now, now, agent_name))
 
-        cursor.execute("SELECT * FROM messages WHERE to_agent = ? AND read_flag = 0", (agent_name,))
+        # Match both short name and team-scoped name (e.g. "spartan" and "gypsy-danger/spartan")
+        cursor.execute("SELECT team FROM agents WHERE name = ?", (agent_name,))
+        team_row = cursor.fetchone()
+        name_variants = [agent_name]
+        if team_row and team_row[0]:
+            name_variants.append(f"{team_row[0]}/{agent_name}")
+        placeholders = ','.join(['?'] * len(name_variants))
+
+        cursor.execute(f"SELECT * FROM messages WHERE to_agent IN ({placeholders}) AND read_flag = 0", name_variants)
         specific_msgs = [dict(row) for row in cursor.fetchall()]
         if specific_msgs:
             ids = [m['id'] for m in specific_msgs]

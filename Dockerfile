@@ -6,9 +6,9 @@ LABEL description="Dead Drop MCP server for multi-agent coordination"
 WORKDIR /app
 
 # Install dependencies
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY src/ ./src/
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 # Default database path inside container
 ENV DEAD_DROP_DB_PATH=/data/messages.db

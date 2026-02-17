@@ -135,7 +135,6 @@ class Spawner:
         try:
             container = self.client.containers.run(
                 IMAGE_NAME,
-                command=["--http"],
                 name=container_name,
                 detach=True,
                 restart_policy={"Name": "unless-stopped"},
@@ -159,7 +158,7 @@ class Spawner:
                     "start_period": 5_000_000_000,  # 5s
                 },
                 mem_limit="128m",
-                cpus=0.25,
+                nano_cpus=250_000_000,  # 0.25 CPU
                 labels={
                     "dead-drop.room": room_name,
                     "dead-drop.type": "room-server",
