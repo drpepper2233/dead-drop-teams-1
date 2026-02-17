@@ -222,6 +222,29 @@ def init_db():
         )
     ''')
 
+    # Phase 6: Minion spawn policy
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS spawn_policy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL UNIQUE,
+            enabled BOOLEAN DEFAULT 1,
+            max_minions INTEGER DEFAULT 3,
+            set_by TEXT NOT NULL,
+            set_at TEXT NOT NULL DEFAULT (datetime("now"))
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS minion_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pilot TEXT NOT NULL,
+            task_description TEXT NOT NULL,
+            status TEXT DEFAULT "spawned",
+            spawned_at TEXT NOT NULL DEFAULT (datetime("now")),
+            completed_at TEXT,
+            result TEXT
+        )
+    ''')
+
     # Migrations — agents
     cursor.execute("PRAGMA table_info(agents)")
     cols = [c[1] for c in cursor.fetchall()]
@@ -1109,6 +1132,126 @@ async def list_contracts(project: str = "", owner: str = "", type: str = "") -> 
         return json.dumps(contracts, indent=2)
     except Exception as e:
         return f"Error listing contracts: {e}"
+    finally:
+        conn.close()
+
+
+# ── Phase 6: Minion Spawn Policy ─────────────────────────────────────
+
+@mcp.tool()
+async def set_spawn_policy(agent_name: str, scope: str, enabled: bool = True, max_minions: int = 3) -> str:
+    """Set minion spawn policy. Only leads can call this. Scope: 'global' or a specific agent name. Controls whether agents can spawn minions and how many."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify caller is a lead
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can set spawn policy."
+
+        cursor.execute("""
+            INSERT INTO spawn_policy (scope, enabled, max_minions, set_by, set_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(scope) DO UPDATE SET
+                enabled = excluded.enabled,
+                max_minions = excluded.max_minions,
+                set_by = excluded.set_by,
+                set_at = excluded.set_at
+        """, (scope, 1 if enabled else 0, max_minions, agent_name, now))
+        conn.commit()
+
+        state = "enabled" if enabled else "disabled"
+        return f"Spawn policy set: scope='{scope}' {state} max_minions={max_minions} (by {agent_name})"
+    except Exception as e:
+        return f"Error setting spawn policy: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def get_spawn_policy(agent_name: str) -> str:
+    """Get effective spawn policy for an agent. Checks agent-specific policy first, falls back to global, then defaults. Returns enabled, max_minions, active_minions, can_spawn."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check agent-specific policy first
+        cursor.execute("SELECT enabled, max_minions FROM spawn_policy WHERE scope = ?", (agent_name,))
+        row = cursor.fetchone()
+
+        if not row:
+            # Fall back to global policy
+            cursor.execute("SELECT enabled, max_minions FROM spawn_policy WHERE scope = 'global'")
+            row = cursor.fetchone()
+
+        if row:
+            enabled = bool(row[0])
+            max_minions = int(row[1])
+        else:
+            # Default policy
+            enabled = True
+            max_minions = 3
+
+        # Count active minions for this pilot
+        cursor.execute(
+            "SELECT COUNT(*) FROM minion_log WHERE pilot = ? AND status = 'spawned'",
+            (agent_name,)
+        )
+        active_minions = cursor.fetchone()[0]
+
+        can_spawn = enabled and active_minions < max_minions
+
+        result = {
+            "enabled": enabled,
+            "max_minions": max_minions,
+            "active_minions": active_minions,
+            "can_spawn": can_spawn,
+        }
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error getting spawn policy: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def log_minion(agent_name: str, task_description: str, status: str, result: str = "") -> str:
+    """Log minion lifecycle events. Status: 'spawned', 'completed', 'failed'. For spawned: creates new entry. For completed/failed: updates most recent spawned entry for this pilot."""
+    valid_statuses = ("spawned", "completed", "failed")
+    if status not in valid_statuses:
+        return f"Invalid status '{status}'. Must be one of: {', '.join(valid_statuses)}"
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        if status == "spawned":
+            cursor.execute(
+                "INSERT INTO minion_log (pilot, task_description, status, spawned_at) VALUES (?, ?, 'spawned', ?)",
+                (agent_name, task_description, now)
+            )
+            conn.commit()
+            minion_id = cursor.lastrowid
+            return f"Minion logged: id={minion_id} pilot={agent_name} status=spawned"
+        else:
+            # Find most recent spawned entry for this pilot
+            cursor.execute(
+                "SELECT id FROM minion_log WHERE pilot = ? AND status = 'spawned' ORDER BY id DESC LIMIT 1",
+                (agent_name,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return f"No active (spawned) minion found for pilot '{agent_name}'."
+
+            minion_id = row[0]
+            cursor.execute(
+                "UPDATE minion_log SET status = ?, completed_at = ?, result = ? WHERE id = ?",
+                (status, now, result or None, minion_id)
+            )
+            conn.commit()
+            return f"Minion updated: id={minion_id} pilot={agent_name} status={status}"
+    except Exception as e:
+        return f"Error logging minion: {e}"
     finally:
         conn.close()
 

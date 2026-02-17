@@ -88,6 +88,18 @@ The protocol is inspired by the neural bridge ("The Drift") from Pacific Rim. Tw
 | `declare_contract` | Register shared interface (DOM IDs, function sigs, API endpoints) |
 | `list_contracts` | Query declared interfaces |
 
+### Minion Spawn Policy (3 tools)
+
+Pilots can spawn headless CLI minions (`claude -p`) for parallelizable grunt work. The lead controls the policy.
+
+| Tool | Purpose |
+|------|---------|
+| `set_spawn_policy` | Lead sets spawn rules: enabled/disabled, max per agent, overrides |
+| `get_spawn_policy` | Query current policy (pilots MUST check before spawning) |
+| `log_minion` | Record spawn/completion events for audit |
+
+Full policy: [docs/MINION_POLICY.md](docs/MINION_POLICY.md)
+
 ### Task Lifecycle (Server-Enforced)
 
 ```
