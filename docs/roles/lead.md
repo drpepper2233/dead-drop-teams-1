@@ -1,4 +1,6 @@
-# Role: Lead
+# Role: Lead (LEGACY)
+
+> **LEGACY ROLE** — Still valid but now includes reviewer + pusher hats by default. See ROLE_COMBOS.md.
 
 The single coordinator. Routes tasks, reviews output, makes decisions. All other agents report here.
 

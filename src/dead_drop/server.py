@@ -8,6 +8,8 @@ import logging
 
 logger = logging.getLogger("dead-drop")
 
+VALID_ROLES = {"lead", "builder", "maintainer", "reviewer", "tester", "fixer", "productionalizer", "demoer", "deliverer", "pen", "pusher", "researcher", "coder"}
+
 # Setup
 DB_PATH = os.getenv("DEAD_DROP_DB_PATH", os.path.expanduser("~/.dead-drop/messages.db"))
 RUNTIME_DIR = os.path.dirname(DB_PATH)
@@ -116,9 +118,14 @@ def get_db():
 
 
 def _get_leads(cursor):
-    """Find all agents with role 'lead'. Returns list of names."""
-    cursor.execute("SELECT name FROM agents WHERE role = 'lead'")
-    return [row[0] for row in cursor.fetchall()]
+    """Find all agents with role containing 'lead'. Returns list of names."""
+    cursor.execute("SELECT name, role FROM agents WHERE role IS NOT NULL")
+    leads = []
+    for row in cursor.fetchall():
+        roles = [r.strip() for r in (row[1] or "").split(",")]
+        if "lead" in roles:
+            leads.append(row[0])
+    return leads
 
 
 def _load_onboarding(role):
@@ -273,6 +280,12 @@ def init_db():
     if 'reply_to' not in mcols:
         cursor.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL")
 
+    # Migrations — tasks
+    cursor.execute("PRAGMA table_info(tasks)")
+    tcols = [c[1] for c in cursor.fetchall()]
+    if 'role_hat' not in tcols:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN role_hat TEXT DEFAULT NULL")
+
     conn.commit()
     conn.close()
 
@@ -284,10 +297,18 @@ init_db()
 
 @mcp.tool()
 async def register(agent_name: str, ctx: Context, role: str = "", description: str = "", team: str = "", token: str = "") -> str:
-    """Registers the caller into the system. Role: 'lead', 'researcher', 'coder', 'builder'. Description: what this agent does. Team: team name for multi-team rooms. Token: room auth token (required if server has DEAD_DROP_ROOM_TOKEN set)."""
+    """Registers the caller into the system. Role: comma-separated list from: lead, builder, maintainer, reviewer, tester, fixer, productionalizer, demoer, deliverer, pen, pusher, researcher, coder. Description: what this agent does. Team: team name for multi-team rooms. Token: room auth token (required if server has DEAD_DROP_ROOM_TOKEN set)."""
     # Room auth token validation
     if ROOM_TOKEN and token != ROOM_TOKEN:
         return "REJECTED: Invalid room token. This server requires a valid auth token to register."
+
+    # Validate roles if provided
+    if role:
+        parsed_roles = [r.strip() for r in role.split(",") if r.strip()]
+        invalid = [r for r in parsed_roles if r not in VALID_ROLES]
+        if invalid:
+            return f"Invalid role(s): {', '.join(invalid)}. Valid roles: {', '.join(sorted(VALID_ROLES))}"
+        role = ",".join(parsed_roles)
 
     conn = get_db()
     cursor = conn.cursor()
@@ -589,8 +610,8 @@ _TASK_TRANSITIONS = {
 
 
 @mcp.tool()
-async def create_task(creator: str, title: str, ctx: Context, description: str = "", assign_to: str = "", project: str = "") -> str:
-    """Create a task. Optionally assign it immediately. Returns task ID. Auto-sends assignment message if assigned."""
+async def create_task(creator: str, title: str, ctx: Context, description: str = "", assign_to: str = "", project: str = "", role_hat: str = "") -> str:
+    """Create a task. Optionally assign it immediately. Returns task ID. Auto-sends assignment message if assigned. role_hat: which role the assignee should wear for this task."""
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
@@ -598,16 +619,20 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
         task_id = _next_task_id(cursor)
         status = "assigned" if assign_to else "pending"
         cursor.execute(
-            "INSERT INTO tasks (id, project, title, description, assigned_to, created_by, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, project, title, description, assign_to or None, creator, status, now, now)
+            "INSERT INTO tasks (id, project, title, description, assigned_to, created_by, status, created_at, updated_at, role_hat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, project, title, description, assign_to or None, creator, status, now, now, role_hat or None)
         )
         conn.commit()
 
         result = f"Task {task_id} created: '{title}' (status: {status})"
+        if role_hat:
+            result += f" role_hat={role_hat}"
 
         # Auto-send assignment message
         if assign_to:
             msg = f"[{task_id}] TASK ASSIGNED: {title}"
+            if role_hat:
+                msg += f"\nROLE HAT: {role_hat}"
             if description:
                 msg += f"\n\n{description}"
             cursor.execute(
@@ -747,6 +772,51 @@ async def list_tasks(status: str = "", assigned_to: str = "", project: str = "")
         return json.dumps(tasks, indent=2)
     except Exception as e:
         return f"Error listing tasks: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def assign_role_hat(agent_name: str, task_id: str, role: str) -> str:
+    """Set which role hat an agent wears for a specific task. Only leads can call this. The role must be one of the agent's registered roles."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify caller is a lead
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can assign role hats."
+
+        # Get the task
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+
+        assignee = task.get("assigned_to")
+        if not assignee:
+            return f"Task {task_id} has no assignee. Assign the task first."
+
+        # Verify the role is one of the assignee's registered roles
+        cursor.execute("SELECT role FROM agents WHERE name = ?", (assignee,))
+        agent_row = cursor.fetchone()
+        if not agent_row or not agent_row[0]:
+            return f"Agent '{assignee}' has no registered roles."
+
+        agent_roles = [r.strip() for r in agent_row[0].split(",")]
+        if role not in agent_roles:
+            return f"Role '{role}' is not in {assignee}'s registered roles: {', '.join(agent_roles)}"
+
+        cursor.execute(
+            "UPDATE tasks SET role_hat = ?, updated_at = ? WHERE id = ?",
+            (role, now, task_id)
+        )
+        conn.commit()
+        return f"Task {task_id}: role_hat set to '{role}' for {assignee}"
+    except Exception as e:
+        return f"Error assigning role hat: {e}"
     finally:
         conn.close()
 

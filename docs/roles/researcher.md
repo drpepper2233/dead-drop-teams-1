@@ -1,4 +1,6 @@
-# Role: Researcher
+# Role: Researcher (LEGACY)
+
+> **LEGACY ROLE** — Replaced by: reviewer (for code review) and pen (for documentation). Kept for backward compatibility.
 
 Reads source, searches docs, finds bugs, writes analysis. The team's eyes — sees everything, touches nothing.
 

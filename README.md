@@ -100,6 +100,25 @@ Pilots can spawn headless CLI minions (`claude -p`) for parallelizable grunt wor
 
 Full policy: [docs/MINION_POLICY.md](docs/MINION_POLICY.md)
 
+## Agent Roles (10 Hats)
+
+Roles are hats, not people. An agent wears multiple hats based on team size. When assigned a task with a `role_hat`, that role's rules apply.
+
+| Role | Access | Minions | Description |
+|------|--------|---------|-------------|
+| builder | Read/Write code | Yes | Writes features and implements specs |
+| maintainer | Read/Write code | Yes | Refactors, upgrades deps, cleans tech debt |
+| reviewer | Read code | No | Reviews PRs, enforces standards, blocks bad merges |
+| tester | Read/Write tests | Yes | Writes and runs tests, reports coverage |
+| fixer | Read/Write code | Yes | Debugs and fixes issues from bug reports |
+| productionalizer | Read/Write code | Yes | Adds logging, error handling, monitoring, hardening |
+| demoer | Read/Write docs | No | Creates demos, screenshots, walkthroughs |
+| deliverer | Read/Write config | Yes | Handles CI/CD, packaging, deployment |
+| pen | Read/Write code | Yes | Security testing, vulnerability scanning, hardening |
+| pusher | Git push access | No | Pushes to remote, manages branches, tags releases |
+
+Full role profiles: [docs/roles/](docs/roles/) | Recommended combos by team size: [docs/ROLE_COMBOS.md](docs/ROLE_COMBOS.md)
+
 ### Task Lifecycle (Server-Enforced)
 
 ```
