@@ -12,10 +12,12 @@ logger = logging.getLogger("dead-drop")
 DB_PATH = os.getenv("DEAD_DROP_DB_PATH", os.path.expanduser("~/.dead-drop/messages.db"))
 RUNTIME_DIR = os.path.dirname(DB_PATH)
 PORT = int(os.getenv("DEAD_DROP_PORT", "9400"))
+HOST = os.getenv("DEAD_DROP_HOST", "127.0.0.1")
+ROOM_TOKEN = os.getenv("DEAD_DROP_ROOM_TOKEN", "")
 
 mcp = FastMCP(
     "Dead Drop Server",
-    host="127.0.0.1",
+    host=HOST,
     port=PORT,
     streamable_http_path="/mcp",
 )
@@ -113,11 +115,10 @@ def get_db():
     return conn
 
 
-def _get_lead(cursor):
-    """Find the agent with role 'lead'. Returns name or None."""
-    cursor.execute("SELECT name FROM agents WHERE role = 'lead' LIMIT 1")
-    row = cursor.fetchone()
-    return row[0] if row else None
+def _get_leads(cursor):
+    """Find all agents with role 'lead'. Returns list of names."""
+    cursor.execute("SELECT name FROM agents WHERE role = 'lead'")
+    return [row[0] for row in cursor.fetchall()]
 
 
 def _load_onboarding(role):
@@ -234,6 +235,8 @@ def init_db():
         cursor.execute("ALTER TABLE agents ADD COLUMN status TEXT DEFAULT 'offline'")
     if 'heartbeat_at' not in cols:
         cursor.execute("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL")
+    if 'team' not in cols:
+        cursor.execute("ALTER TABLE agents ADD COLUMN team TEXT DEFAULT ''")
 
     # Migrations — messages
     cursor.execute("PRAGMA table_info(messages)")
@@ -257,28 +260,35 @@ init_db()
 # ── Tools ────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def register(agent_name: str, ctx: Context, role: str = "", description: str = "") -> str:
-    """Registers the caller into the system. Role: 'lead', 'researcher', 'coder', 'builder'. Description: what this agent does."""
+async def register(agent_name: str, ctx: Context, role: str = "", description: str = "", team: str = "", token: str = "") -> str:
+    """Registers the caller into the system. Role: 'lead', 'researcher', 'coder', 'builder'. Description: what this agent does. Team: team name for multi-team rooms. Token: room auth token (required if server has DEAD_DROP_ROOM_TOKEN set)."""
+    # Room auth token validation
+    if ROOM_TOKEN and token != ROOM_TOKEN:
+        return "REJECTED: Invalid room token. This server requires a valid auth token to register."
+
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
         cursor.execute("""
-            INSERT INTO agents (name, registered_at, last_seen, role, description, status)
-            VALUES (?, ?, ?, ?, ?, 'waiting for work')
+            INSERT INTO agents (name, registered_at, last_seen, role, description, status, team)
+            VALUES (?, ?, ?, ?, ?, 'waiting for work', ?)
             ON CONFLICT(name) DO UPDATE SET
                 last_seen = ?,
                 role = COALESCE(NULLIF(?, ''), agents.role),
                 description = COALESCE(NULLIF(?, ''), agents.description),
+                team = COALESCE(NULLIF(?, ''), agents.team),
                 status = 'waiting for work'
-        """, (agent_name, now, now, role or None, description or None, now, role, description))
+        """, (agent_name, now, now, role or None, description or None, team or '',
+              now, role, description, team))
         conn.commit()
 
         # Register session for push notifications
         await _register_session(agent_name, ctx.session)
 
         role_note = f" role={role}" if role else ""
-        result = f"Agent '{agent_name}' registered successfully.{role_note}"
+        team_note = f" team={team}" if team else ""
+        result = f"Agent '{agent_name}' registered successfully.{role_note}{team_note}"
         onboarding = _load_onboarding(role)
         if onboarding:
             result += f"\n\n# Onboarding\n\nRead and follow these instructions for your session:\n\n{onboarding}"
@@ -332,6 +342,23 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
         if from_agent not in _agent_sessions:
             await _register_session(from_agent, ctx.session)
 
+        # Resolve team-scoped short names: if to_agent is a short name (no '/'),
+        # check if it's unambiguous. If multiple agents share the name across teams,
+        # require the full {team}/{agent_name} format.
+        resolved_to = to_agent
+        if to_agent != 'all' and '/' not in to_agent:
+            cursor.execute("SELECT name, team FROM agents WHERE name = ?", (to_agent,))
+            matches = cursor.fetchall()
+            if not matches:
+                # Check if it's a team-qualified name stored differently
+                cursor.execute("SELECT name FROM agents WHERE name LIKE ?", (f"%/{to_agent}",))
+                team_matches = cursor.fetchall()
+                if len(team_matches) == 1:
+                    resolved_to = team_matches[0][0]
+                elif len(team_matches) > 1:
+                    names = [r[0] for r in team_matches]
+                    return f"AMBIGUOUS: Multiple agents named '{to_agent}' across teams: {', '.join(names)}. Use full name (team/agent)."
+
         # Auto-inherit task_id from reply_to message if not explicitly set
         effective_task_id = task_id or None
         effective_reply_to = reply_to if reply_to else None
@@ -344,30 +371,31 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
         # Insert primary message
         cursor.execute(
             "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id, reply_to) VALUES (?, ?, ?, ?, 0, 0, ?, ?)",
-            (from_agent, to_agent, message, now, effective_task_id, effective_reply_to)
+            (from_agent, resolved_to, message, now, effective_task_id, effective_reply_to)
         )
 
-        # Build CC list: explicit + auto-CC lead
+        # Build CC list: explicit + auto-CC all leads
         cc_agents = [a.strip() for a in cc.split(",") if a.strip()] if cc else []
-        lead_name = _get_lead(cursor)
-        if lead_name and from_agent != lead_name and to_agent != lead_name and lead_name not in cc_agents:
-            cc_agents.append(lead_name)
+        leads = _get_leads(cursor)
+        for lead_name in leads:
+            if from_agent != lead_name and resolved_to != lead_name and lead_name not in cc_agents:
+                cc_agents.append(lead_name)
 
         for cc_agent in cc_agents:
-            if cc_agent != to_agent:
+            if cc_agent != resolved_to:
                 cursor.execute(
                     "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to, task_id, reply_to) VALUES (?, ?, ?, ?, 0, 1, ?, ?, ?)",
-                    (from_agent, cc_agent, message, now, to_agent, effective_task_id, effective_reply_to)
+                    (from_agent, cc_agent, message, now, resolved_to, effective_task_id, effective_reply_to)
                 )
 
         conn.commit()
 
         # ── Push notifications to recipients ──
         notify_targets = []
-        if to_agent == 'all':
+        if resolved_to == 'all':
             notify_targets = [a for a in _agent_sessions if a != from_agent]
         else:
-            notify_targets.append(to_agent)
+            notify_targets.append(resolved_to)
         for cc_agent in cc_agents:
             if cc_agent not in notify_targets and cc_agent != from_agent:
                 notify_targets.append(cc_agent)
@@ -376,7 +404,7 @@ async def send(from_agent: str, to_agent: str, message: str, ctx: Context, cc: s
 
         cc_note = f" (cc: {cc})" if cc else ""
         task_note = f" [task: {effective_task_id}]" if effective_task_id else ""
-        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}{task_note}."
+        return f"Message sent from '{from_agent}' to '{resolved_to}'{cc_note}{task_note}."
     except Exception as e:
         return f"Error sending message: {e}"
     finally:
@@ -548,16 +576,17 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
                 "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
                 (creator, assign_to, msg, now, task_id)
             )
-            # CC lead if creator isn't lead
-            lead_name = _get_lead(cursor)
-            if lead_name and creator != lead_name and assign_to != lead_name:
+            # CC all leads if creator isn't a lead
+            leads = _get_leads(cursor)
+            cc_leads = [l for l in leads if l != creator and l != assign_to]
+            for lead_name in cc_leads:
                 cursor.execute(
                     "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to, task_id) VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
                     (creator, lead_name, msg, now, assign_to, task_id)
                 )
             conn.commit()
             await _notify_agent(assign_to)
-            if lead_name and creator != lead_name and assign_to != lead_name:
+            for lead_name in cc_leads:
                 await _notify_agent(lead_name)
             result += f" → assigned to {assign_to}"
 
@@ -588,10 +617,10 @@ async def update_task(agent_name: str, task_id: str, status: str, ctx: Context, 
             return f"Invalid transition: {old_status} → {status}. Valid: {', '.join(valid) if valid else 'none (terminal state)'}"
 
         required_role = _TASK_TRANSITIONS[transition]
-        lead_name = _get_lead(cursor)
+        leads = _get_leads(cursor)
 
-        if required_role == "lead" and agent_name != lead_name:
-            return f"Only the lead ({lead_name}) can transition {old_status} → {status}."
+        if required_role == "lead" and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads) or 'none registered'}) can transition {old_status} → {status}."
         if required_role == "assignee" and agent_name != task["assigned_to"]:
             return f"Only the assigned agent ({task['assigned_to']}) can transition {old_status} → {status}."
 
@@ -613,13 +642,14 @@ async def update_task(agent_name: str, task_id: str, status: str, ctx: Context, 
         if result:
             msg += f"\n\n{result}"
 
-        if required_role == "assignee" and lead_name:
-            # Assignee changed status → notify lead
-            cursor.execute(
-                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
-                (agent_name, lead_name, msg, now, task_id)
-            )
-            notify_targets.append(lead_name)
+        if required_role == "assignee" and leads:
+            # Assignee changed status → notify all leads
+            for lead_name in leads:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                    (agent_name, lead_name, msg, now, task_id)
+                )
+                notify_targets.append(lead_name)
         elif required_role == "lead" and task["assigned_to"]:
             # Lead changed status → notify assignee
             cursor.execute(
@@ -693,9 +723,9 @@ async def initiate_handshake(from_agent: str, message: str, ctx: Context, agents
     now = datetime.datetime.now().isoformat()
     try:
         # Verify lead
-        lead_name = _get_lead(cursor)
-        if lead_name and from_agent != lead_name:
-            return f"Only the lead ({lead_name}) can initiate handshakes."
+        leads = _get_leads(cursor)
+        if leads and from_agent not in leads:
+            return f"Only a lead ({', '.join(leads)}) can initiate handshakes."
 
         # Determine target agents
         if agents:
@@ -773,15 +803,18 @@ async def ack_handshake(agent_name: str, handshake_id: int, ctx: Context) -> str
 
         if not pending:
             cursor.execute("UPDATE handshakes SET status = 'completed' WHERE id = ?", (handshake_id,))
+            # Notify the initiator + all leads that agents are synced
+            initiator = hs["initiated_by"]
+            leads = _get_leads(cursor)
+            notify_set = set(leads) | {initiator}
+            for target in notify_set:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc) VALUES (?, ?, ?, ?, 0, 0)",
+                    ("system", target, f"[HANDSHAKE #{handshake_id}] ALL AGENTS SYNCED. Ready for GO signal.", now)
+                )
             conn.commit()
-            # Notify lead that all agents are synced
-            lead_name = hs["initiated_by"]
-            cursor.execute(
-                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc) VALUES (?, ?, ?, ?, 0, 0)",
-                ("system", lead_name, f"[HANDSHAKE #{handshake_id}] ALL AGENTS SYNCED. Ready for GO signal.", now)
-            )
-            conn.commit()
-            await _notify_agent(lead_name)
+            for target in notify_set:
+                await _notify_agent(target)
             return f"ACK recorded. Handshake #{handshake_id} COMPLETE — all agents synced!"
         else:
             conn.commit()
@@ -875,21 +908,23 @@ async def submit_for_review(agent_name: str, task_id: str, summary: str, ctx: Co
         })
         cursor.execute("UPDATE tasks SET status = 'review', result = ?, updated_at = ? WHERE id = ?", (review_data, now, task_id))
 
-        # Send structured review message to lead
-        lead_name = _get_lead(cursor)
-        if lead_name:
+        # Send structured review message to all leads
+        leads = _get_leads(cursor)
+        if leads:
             msg = f"[REVIEW] {task_id}: {task['title']}\n\nSUMMARY: {summary}"
             if files_changed:
                 msg += f"\nFILES: {files_changed}"
             if test_results:
                 msg += f"\nTESTS: {test_results}"
             msg += f"\n\nAwaiting review. Use approve_task or reject_task."
-            cursor.execute(
-                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
-                (agent_name, lead_name, msg, now, task_id)
-            )
+            for lead_name in leads:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                    (agent_name, lead_name, msg, now, task_id)
+                )
             conn.commit()
-            await _notify_agent(lead_name)
+            for lead_name in leads:
+                await _notify_agent(lead_name)
         else:
             conn.commit()
 
@@ -907,9 +942,9 @@ async def approve_task(agent_name: str, task_id: str, ctx: Context, notes: str =
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
-        lead_name = _get_lead(cursor)
-        if lead_name and agent_name != lead_name:
-            return f"Only the lead ({lead_name}) can approve tasks."
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can approve tasks."
 
         cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
         task = cursor.fetchone()
@@ -949,9 +984,9 @@ async def reject_task(agent_name: str, task_id: str, reason: str, ctx: Context) 
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
-        lead_name = _get_lead(cursor)
-        if lead_name and agent_name != lead_name:
-            return f"Only the lead ({lead_name}) can reject tasks."
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can reject tasks."
 
         cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
         task = cursor.fetchone()
@@ -1118,13 +1153,33 @@ def main():
     """Run the Dead Drop MCP server.
 
     Usage:
-        dead-drop-teams          # stdio transport (backward compatible)
-        dead-drop-teams --http   # Streamable HTTP on port 9400 (push notifications)
+        dead-drop-teams                           # stdio transport (backward compatible)
+        dead-drop-teams --http                    # Streamable HTTP on default host/port
+        dead-drop-teams --http --host 0.0.0.0     # Bind to all interfaces
+        dead-drop-teams --http --port 9501        # Custom port
     """
+    global HOST, PORT
+
+    # Parse --host and --port from argv
+    args = sys.argv[1:]
+    if "--host" in args:
+        idx = args.index("--host")
+        if idx + 1 < len(args):
+            HOST = args[idx + 1]
+            mcp._mcp_server._options = None  # Reset cached options
+    if "--port" in args:
+        idx = args.index("--port")
+        if idx + 1 < len(args):
+            PORT = int(args[idx + 1])
+
+    # Apply host/port to FastMCP
+    mcp._host = HOST
+    mcp._port = PORT
+
     transport = "stdio"
-    if "--http" in sys.argv:
+    if "--http" in args:
         transport = "streamable-http"
-        logger.info(f"Dead Drop server starting on http://127.0.0.1:{PORT}/mcp")
+        logger.info(f"Dead Drop server starting on http://{HOST}:{PORT}/mcp")
     mcp.run(transport=transport)
 
 
