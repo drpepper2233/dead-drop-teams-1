@@ -1,119 +1,172 @@
 # dead-drop-teams
 
-A message-passing server that lets multiple AI agents talk to each other and coordinate work — like a shared inbox for your AI team.
+A shared MCP server that lets multiple AI agents (Claude Code, Gemini CLI, Codex CLI) talk to each other with **push notifications** — no polling required.
 
 ## What It Does
 
-You give tasks to a team of AI agents. They need to communicate: the researcher finds a bug, tells the coder to fix it, the builder runs the tests. **dead-drop-teams** is the mailbox system that makes this work.
+You give tasks to a team of AI agents. They need to communicate: the researcher finds a bug, tells the coder to fix it, the builder runs the tests. **dead-drop-teams** is the message bus that makes this work.
 
-- Agents register with a name and role (lead, researcher, coder, builder)
-- They send messages to each other through the server
-- The team lead automatically gets copied on everything (so nothing happens without visibility)
-- Messages are stored in a local SQLite database — no cloud, no external services
+- Single HTTP server, multiple clients connect simultaneously
+- Push notifications via MCP `tools/list_changed` + `send_log_message`
+- Background file watcher (`fswatch`) wakes up idle agents automatically
+- Messages stored in local SQLite (WAL mode) — no cloud, no external services
+- Team lead auto-CC'd on all messages for full visibility
+
+## Architecture
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Claude  │     │  Claude  │     │  Gemini  │
+│  (juno)  │     │ (spartan)│     │   CLI    │
+└────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                │                │
+     │  Streamable HTTP (port 9400)    │
+     ▼                ▼                ▼
+┌─────────────────────────────────────────────┐
+│        dead-drop-teams HTTP server          │
+│     (FastMCP + uvicorn on 127.0.0.1:9400)   │
+├─────────────────────────────────────────────┤
+│  Connection Registry (agent → session)      │
+│  Push: tools/list_changed + log_message     │
+│  Dynamic tool descriptions (unread alerts)  │
+├─────────────────────────────────────────────┤
+│            SQLite WAL database              │
+│  ┌─────────┐ ┌──────────┐ ┌──────────────┐ │
+│  │ agents  │ │ messages │ │broadcast_reads│ │
+│  └─────────┘ └──────────┘ └──────────────┘ │
+└─────────────────────────────────────────────┘
+```
+
+## How Push Notifications Work
+
+```
+1. Agent A calls send(to_agent="spartan", message="...")
+2. Server stores message in SQLite
+3. Server pushes tools/list_changed + log_message to spartan's session
+4. Spartan's background watcher (fswatch) detects DB change
+5. Watcher exits with alert: "YOU HAVE 1 UNREAD MESSAGE(S)"
+6. Claude Code surfaces the completed background task
+7. Agent sees the alert and calls check_inbox automatically
+```
+
+No polling. Event-driven at every layer — same pattern as an Android app receiving an HTTP POST.
 
 ## Quick Start
-
-Tell your AI agent:
-
-> "Set up dead-drop-teams from ~/projects/dead-drop-teams. Install it, configure the MCP server in Claude Code settings, and restart."
-
-Your agent will handle the rest. If it needs specifics, here they are:
 
 ### Install
 
 ```bash
-cd ~/projects/dead-drop-teams
+git clone git@gitlab.com:Jessehampton05/dead-drop-teams.git ~/dead-drop-teams
+cd ~/dead-drop-teams
 uv venv && source .venv/bin/activate && uv pip install -e .
 ```
 
-Or with pip:
+### Start the HTTP Server
 
 ```bash
-cd ~/projects/dead-drop-teams
-python -m venv .venv && source .venv/bin/activate && pip install -e .
+# One-time: install the launchd daemon
+cp ~/dead-drop-teams/com.dead-drop.server.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dead-drop.server.plist
 ```
 
-Requires Python 3.12+.
+Or run manually:
 
-### Configure
+```bash
+dead-drop-teams --http
+```
 
-Add to your MCP config (Claude Code uses `~/.claude/settings.json` under `mcpServers`):
+Server runs on `http://127.0.0.1:9400/mcp`.
+
+### Configure Clients
+
+**Claude Code** (`~/.claude/settings.json` or `~/.mcp.json`):
 
 ```json
 {
-  "dead-drop": {
-    "command": "/path/to/dead-drop-teams/.venv/bin/dead-drop-teams",
-    "args": []
+  "mcpServers": {
+    "dead-drop": {
+      "type": "http",
+      "url": "http://localhost:9400/mcp"
+    }
   }
 }
 ```
 
-The database is created automatically at `~/.dead-drop/messages.db`. To change the location, set the `DEAD_DROP_DB_PATH` environment variable.
+**Gemini CLI** (`~/.gemini/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "dead-drop": {
+      "httpUrl": "http://localhost:9400/mcp",
+      "trust": true
+    }
+  }
+}
+```
 
 Restart your AI tool after adding the config.
 
-## How It Works
+### Agent Prompt
 
-### Agents and Roles
-
-Each AI session registers as an agent with a role:
-
-| Role | What They Do | Example |
-|------|-------------|---------|
-| **lead** | Coordinates the team, reviews work, makes decisions | Claude Opus |
-| **researcher** | Reads code, finds bugs, writes analysis | Gemini (large context) |
-| **coder** | Writes code from specific instructions | Claude Sonnet |
-| **builder** | Builds, runs tests, executes commands | Claude Haiku |
-
-### The CC Rule
-
-The lead sees everything. When any agent sends a message to another agent, the lead automatically gets a copy tagged `[CC]`. This means:
-
-- The lead always knows what's happening
-- No side conversations the lead can't see
-- The lead can spawn ephemeral agents (coder, builder) when a CC tells them work is needed
-
-### Message Flow
+Give your agent this on startup:
 
 ```
-Researcher finds bug → sends to Lead
-Lead sends fix instructions → to Coder
-Coder finishes → sends "ready to test" → to Lead (or to Builder, Lead gets CC)
-Lead tells Builder → "build and test"
-Builder reports → pass/fail → to Lead
+You have MCP tools from a server called "dead-drop".
+
+1. register(agent_name="YOUR_NAME", role="coder", description="what you do")
+2. check_inbox(agent_name="YOUR_NAME")
+3. Run in background: ~/dead-drop-teams/scripts/wait-for-message.sh YOUR_NAME
+
+Rules:
+- Always use YOUR_NAME as agent_name
+- You must check_inbox before you can send
+- When the background watcher alerts you, call check_inbox immediately
+- After each check_inbox, relaunch the background watcher
 ```
-
-### Inbox Discipline
-
-- Agents must read their inbox before they can send (enforced by the server)
-- This prevents message pileup and ensures agents process incoming work before creating more
 
 ## Tools
 
-The server exposes 5 tools via MCP:
+| Tool | Params | Description |
+|------|--------|-------------|
+| `register` | `agent_name`, `role`, `description` | Register + capture session for push |
+| `send` | `from_agent`, `to_agent`, `message`, `cc` | Send message, notify recipients |
+| `check_inbox` | `agent_name` | Get unread messages, mark read |
+| `set_status` | `agent_name`, `status` | Update agent status |
+| `get_history` | `count` | Last N messages |
+| `deregister` | `agent_name` | Remove agent + cleanup session |
+| `who` | — | List agents (includes `connected` field) |
 
-| Tool | What It Does |
-|------|-------------|
-| `register` | Sign in with your name, role, and description |
-| `send` | Send a message to another agent (or "all" for broadcast) |
-| `check_inbox` | Read your unread messages (marks them as read) |
-| `who` | See all registered agents and when they last checked in |
-| `get_history` | Get the last N messages (useful after context resets) |
+## Roles
 
-## For Long-Running Tasks
+| Role | Lifecycle | Function |
+|------|-----------|----------|
+| `lead` | Persistent | Coordinates, reviews, routes tasks |
+| `researcher` | Persistent | Reads source, finds bugs, writes analysis |
+| `coder` | Ephemeral | Writes code from specific instructions |
+| `builder` | Ephemeral | Builds, runs tests, executes commands |
 
-Agents working on builds or tests should write progress to shared log files:
+## The CC Rule
 
-```
-.dead-drop/<agent-name>/<task>.log
-```
+The lead sees everything. When any agent sends a message, the lead automatically gets a CC copy. No side conversations without visibility.
 
-When done, send one summary message. Don't spam the inbox with progress updates.
+## Key Files
 
-## Protocol Details
+| File | Purpose |
+|------|---------|
+| `src/dead_drop/server.py` | Main server — tools, push, HTTP transport |
+| `scripts/wait-for-message.sh` | Background watcher for idle agents |
+| `tests/test_push_e2e.py` | End-to-end push notification test |
+| `docs/PROTOCOL.md` | Agent-facing protocol rules |
+| `~/.dead-drop/messages.db` | SQLite database |
+| `~/.dead-drop/server.log` | Server logs |
 
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full specification.
+## Requirements
+
+- Python 3.12+
+- macOS (for `fswatch` and `launchd`)
+- `fswatch` (`brew install fswatch`)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
