@@ -26,8 +26,8 @@ VOLUME /data
 
 EXPOSE 9400
 
-# Health check — hit the MCP endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${DEAD_DROP_PORT}/mcp')" || exit 1
+# Health check — POST a valid MCP ping to the endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,json; r=urllib.request.Request('http://localhost:9400/mcp',data=json.dumps({'jsonrpc':'2.0','id':0,'method':'initialize','params':{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'healthcheck','version':'1.0'}}}).encode(),headers={'Content-Type':'application/json','Accept':'application/json, text/event-stream'}); urllib.request.urlopen(r)" || exit 1
 
 CMD ["python", "-m", "dead_drop.server", "--http", "--host", "0.0.0.0", "--port", "9400"]

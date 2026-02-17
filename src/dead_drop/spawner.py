@@ -151,11 +151,13 @@ class Spawner:
                 },
                 healthcheck={
                     "test": ["CMD", "python3", "-c",
-                             "import urllib.request; urllib.request.urlopen('http://localhost:9400/mcp')"],
-                    "interval": 10_000_000_000,   # 10s in nanoseconds
+                             "import urllib.request,json; r=urllib.request.Request('http://localhost:9400/mcp',"
+                             "data=json.dumps({'jsonrpc':'2.0','id':0,'method':'initialize','params':{'protocolVersion':'2024-11-05','capabilities':{},'clientInfo':{'name':'healthcheck','version':'1.0'}}}).encode(),"
+                             "headers={'Content-Type':'application/json','Accept':'application/json, text/event-stream'}); urllib.request.urlopen(r)"],
+                    "interval": 30_000_000_000,    # 30s in nanoseconds
                     "timeout": 5_000_000_000,      # 5s
                     "retries": 3,
-                    "start_period": 5_000_000_000,  # 5s
+                    "start_period": 10_000_000_000, # 10s
                 },
                 mem_limit="128m",
                 nano_cpus=250_000_000,  # 0.25 CPU
