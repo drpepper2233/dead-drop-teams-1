@@ -8,13 +8,46 @@
 2. `check_inbox(agent_name)` — read any waiting messages
 3. Run in background: `~/dead-drop-teams/scripts/wait-for-message.sh YOUR_NAME`
 
-## After Context Compaction
+## Compaction Protocol
 
-If you lost context, recover immediately:
+### Rule: Self-Contained Messages (MANDATORY)
+
+Every message between agents MUST include enough context to be understood without any prior conversation history. Treat every message like the recipient just woke up from amnesia.
+
+Task completion format:
+```
+PROJECT: [project name/path]
+TASK: [what was assigned]
+RESULT: [what was done — files, locations, details]
+CURRENT STATE: [what works, what doesn't]
+NEXT: [what should happen next]
+```
+
+Task assignment format:
+```
+PROJECT: [project name/path]
+TASK: [what to do]
+FILES: [which files to touch]
+CONTEXT: [why, what depends on it]
+DO NOT: [boundaries]
+```
+
+### Pre-Compaction Checkpoint (Best Effort)
+
+When juno notices context is getting long (lots of tool calls, deep in a task):
+1. Send a checkpoint to yourself: `send(from="juno", to="juno", message="CHECKPOINT: ...")`
+   — this persists in SQLite and survives compaction
+2. Optionally broadcast: "Context getting long, include extra context in messages"
+
+### Post-Compaction Recovery
+
+After compaction, juno recovers immediately:
 1. Re-register with `register()`
 2. `check_inbox()` to get waiting messages
-3. `get_history(10)` to catch up on cross-agent state
-4. Relaunch the background watcher
+3. `get_history(20)` to recover cross-agent state from SQLite
+4. `who()` to see active agents and their current status
+5. Set status to "recovered from compaction"
+6. Relaunch the background watcher
 
 ## Agent Names
 
