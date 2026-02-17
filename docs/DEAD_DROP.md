@@ -69,6 +69,14 @@ Each agent owns a **hemisphere** — a distinct half of the system. Like Jaeger 
 - Another owns logic/data (JS, API, state management)
 - Each hemisphere works **simultaneously**, not one after the other
 
+### File Ownership by Name
+Every file you create has your agent name in the filename. Ownership is the filename itself — no lock files, no protocols, no forgetting.
+- `juno-index.html`, `juno-style.css`
+- `spartan-app.js`, `spartan-utils.js`
+- `cortana-engine.js`, `cortana-api.js`
+
+If you see another agent's name on a file, **don't touch it** without messaging them first. Survives compaction because it's literally the file name. juno owns the main entry point (e.g. `index.html`) that imports everything — that's the integration point.
+
 ### Shared Memory (The Drift State)
 Agents share state through the project files themselves — the codebase IS the shared memory. When you write a file, you're writing to the shared brain. Rules:
 - **Declare interfaces up front.** DOM IDs, function signatures, file paths — agreed on during the handshake.
