@@ -8,7 +8,8 @@ import logging
 
 logger = logging.getLogger("dead-drop")
 
-VALID_ROLES = {"lead", "builder", "maintainer", "reviewer", "tester", "fixer", "productionalizer", "demoer", "deliverer", "pen", "pusher", "researcher", "coder"}
+VALID_ROLES = {"lead", "builder", "fixer", "tester", "reviewer", "productionalizer", "pen", "shipper", "researcher", "coder"}
+LEGACY_ROLES = {"maintainer", "demoer", "deliverer", "pusher"}
 
 # Setup
 DB_PATH = os.getenv("DEAD_DROP_DB_PATH", os.path.expanduser("~/.dead-drop/messages.db"))
@@ -305,7 +306,7 @@ async def register(agent_name: str, ctx: Context, role: str = "", description: s
     # Validate roles if provided
     if role:
         parsed_roles = [r.strip() for r in role.split(",") if r.strip()]
-        invalid = [r for r in parsed_roles if r not in VALID_ROLES]
+        invalid = [r for r in parsed_roles if r not in VALID_ROLES and r not in LEGACY_ROLES]
         if invalid:
             return f"Invalid role(s): {', '.join(invalid)}. Valid roles: {', '.join(sorted(VALID_ROLES))}"
         role = ",".join(parsed_roles)
@@ -597,6 +598,38 @@ def _next_task_id(cursor):
     return f"TASK-{num:03d}"
 
 
+_CONFLICTING_HATS = {
+    "builder": {"tester", "reviewer"},
+    "tester": {"builder", "shipper"},
+    "reviewer": {"builder"},
+    "fixer": {"reviewer", "tester"},
+    "shipper": {"tester"},
+    "pen": {"builder"},
+}
+
+
+def _check_hat_conflict(cursor, agent_name, role_hat, project):
+    """Check if assigning role_hat to agent on project would conflict with prior hats."""
+    if not role_hat or not project:
+        return None
+
+    blocked_by = _CONFLICTING_HATS.get(role_hat)
+    if not blocked_by:
+        return None
+
+    placeholders = ','.join(['?'] * len(blocked_by))
+    cursor.execute(
+        f"SELECT role_hat FROM tasks WHERE assigned_to = ? AND project = ? AND role_hat IN ({placeholders}) AND status IN ('completed', 'review', 'in_progress') LIMIT 1",
+        (agent_name, project, *blocked_by)
+    )
+    row = cursor.fetchone()
+    if row:
+        prior_hat = row[0]
+        return f"BLOCKED: {agent_name} was a {prior_hat} on project '{project}' and cannot wear the {role_hat} hat. Assign a different agent."
+
+    return None
+
+
 # Valid state transitions: (from_status, to_status) -> who can do it
 _TASK_TRANSITIONS = {
     ("pending", "assigned"): "lead",
@@ -616,6 +649,12 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
+        # Check hat conflict before creating
+        if role_hat and project and assign_to:
+            conflict = _check_hat_conflict(cursor, assign_to, role_hat, project)
+            if conflict:
+                return conflict
+
         task_id = _next_task_id(cursor)
         status = "assigned" if assign_to else "pending"
         cursor.execute(
@@ -809,6 +848,13 @@ async def assign_role_hat(agent_name: str, task_id: str, role: str) -> str:
         if role not in agent_roles:
             return f"Role '{role}' is not in {assignee}'s registered roles: {', '.join(agent_roles)}"
 
+        # Check hat conflict
+        task_project = task.get("project", "")
+        if task_project:
+            conflict = _check_hat_conflict(cursor, assignee, role, task_project)
+            if conflict:
+                return conflict
+
         cursor.execute(
             "UPDATE tasks SET role_hat = ?, updated_at = ? WHERE id = ?",
             (role, now, task_id)
@@ -817,6 +863,35 @@ async def assign_role_hat(agent_name: str, task_id: str, role: str) -> str:
         return f"Task {task_id}: role_hat set to '{role}' for {assignee}"
     except Exception as e:
         return f"Error assigning role hat: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def hat_history(project: str) -> str:
+    """List all role_hat assignments for a project. Shows who wore what hat, for which task, and the task status."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT assigned_to, role_hat, id, title, status FROM tasks WHERE project = ? AND role_hat IS NOT NULL ORDER BY created_at ASC",
+            (project,)
+        )
+        rows = cursor.fetchall()
+        history = []
+        for row in rows:
+            history.append({
+                "agent": row[0],
+                "role_hat": row[1],
+                "task_id": row[2],
+                "task_title": row[3],
+                "status": row[4],
+            })
+        if not history:
+            return f"No role_hat assignments found for project '{project}'."
+        return json.dumps(history, indent=2)
+    except Exception as e:
+        return f"Error fetching hat history: {e}"
     finally:
         conn.close()
 

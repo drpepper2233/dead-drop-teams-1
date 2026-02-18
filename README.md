@@ -100,22 +100,31 @@ Pilots can spawn headless CLI minions (`claude -p`) for parallelizable grunt wor
 
 Full policy: [docs/MINION_POLICY.md](docs/MINION_POLICY.md)
 
-## Agent Roles (10 Hats)
+## Agent Roles (8 Hats)
 
 Roles are hats, not people. An agent wears multiple hats based on team size. When assigned a task with a `role_hat`, that role's rules apply.
 
 | Role | Access | Minions | Description |
 |------|--------|---------|-------------|
+| lead | Full | No | Coordinates, reviews, routes tasks, owns the plan |
 | builder | Read/Write code | Yes | Writes features and implements specs |
-| maintainer | Read/Write code | Yes | Refactors, upgrades deps, cleans tech debt |
-| reviewer | Read code | No | Reviews PRs, enforces standards, blocks bad merges |
+| fixer | Read/Write code | Yes | Debugs, fixes bugs, refactors, cleans tech debt |
 | tester | Read/Write tests | Yes | Writes and runs tests, reports coverage |
-| fixer | Read/Write code | Yes | Debugs and fixes issues from bug reports |
+| reviewer | Read code | No | Reviews code, enforces standards, blocks bad merges |
 | productionalizer | Read/Write code | Yes | Adds logging, error handling, monitoring, hardening |
-| demoer | Read/Write docs | No | Creates demos, screenshots, walkthroughs |
-| deliverer | Read/Write config | Yes | Handles CI/CD, packaging, deployment |
 | pen | Read/Write code | Yes | Security testing, vulnerability scanning, hardening |
-| pusher | Git push access | No | Pushes to remote, manages branches, tags releases |
+| shipper | Git push + config | No | Pushes to remote, manages branches, CI/CD, packaging, deployment |
+
+**Deprecated (still accepted, mapped to active roles):** maintainer (use fixer), deliverer (use shipper), pusher (use shipper), demoer (use shipper)
+
+### Conflict Rules
+
+| Role A | Cannot be same agent as |
+|--------|------------------------|
+| builder | tester, reviewer |
+| fixer | tester, reviewer |
+| pen | builder |
+| shipper | tester |
 
 Full role profiles: [docs/roles/](docs/roles/) | Recommended combos by team size: [docs/ROLE_COMBOS.md](docs/ROLE_COMBOS.md)
 

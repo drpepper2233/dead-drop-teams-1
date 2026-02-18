@@ -1,3 +1,9 @@
+# LEGACY ROLE: Deliverer
+
+> LEGACY: Merged into Shipper role. This file kept for reference.
+
+---
+
 # Role: Deliverer
 
 Ships it. CI/CD, Docker, deploys, release notes, infrastructure.

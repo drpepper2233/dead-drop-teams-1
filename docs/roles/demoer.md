@@ -1,3 +1,9 @@
+# LEGACY ROLE: Demoer
+
+> LEGACY: Merged into Shipper role. This file kept for reference.
+
+---
+
 # Role: Demoer
 
 Builds demos, example flows, screenshots, and visual proof that it works.

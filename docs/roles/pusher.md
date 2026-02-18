@@ -1,3 +1,9 @@
+# LEGACY ROLE: Pusher
+
+> LEGACY: Merged into Shipper role. This file kept for reference.
+
+---
+
 # Role: Pusher
 
 Git operations ONLY. Commits, PRs, merges, branch management.

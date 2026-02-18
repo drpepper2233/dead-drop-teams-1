@@ -1,3 +1,9 @@
+# LEGACY ROLE: Maintainer
+
+> LEGACY: Merged into Fixer role. This file kept for reference.
+
+---
+
 # Role: Maintainer
 
 Updates dependencies, fixes tech debt, refactors, and keeps the codebase healthy.
