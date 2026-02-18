@@ -128,6 +128,56 @@ Roles are hats, not people. An agent wears multiple hats based on team size. Whe
 
 Full role profiles: [docs/roles/](docs/roles/) | Recommended combos by team size: [docs/ROLE_COMBOS.md](docs/ROLE_COMBOS.md)
 
+## Goals and Verification
+
+Goals group tasks. Every task completion requires independent verification by a different agent. Goal completion requires lead verification. Nothing ships unverified.
+
+### Verification Chain
+
+```
+GOAL created
+  └─ TASK completed by builder
+       └─ CHECK by verifier (different agent)
+            └─ TASK verified ──┐
+                               ├─ all tasks verified
+                               │    └─ GOAL reviewed by lead
+                               │         └─ GOAL verified ✓
+                               └─ rejected → task back to in_progress (2 rejections → escalate to lead)
+```
+
+### Verification Tools (6 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `create_goal` | Create a goal that groups related tasks |
+| `link_task_to_goal` | Attach a task to a goal |
+| `goal_status` | Check goal progress — tasks completed, verified, pending |
+| `verify_task` | Verifier confirms a completed task passes checks |
+| `reject_verification` | Verifier rejects — task returns to in_progress with feedback |
+| `verify_goal` | Lead confirms all verified tasks integrate correctly |
+
+### Verification Rules
+
+- **Builder cannot verify their own task** — independent confirmation required
+- **Reviewer cannot verify a task they reviewed** — separate set of eyes
+- **Verifier wears implicit tester hat** — conflict rules apply (builder != tester)
+- **Only leads can verify goals** — final quality gate
+- **Rejection sends task back to in_progress** with feedback attached
+- **Two rejections on same task escalate to lead** — lead reassigns or overrides
+
+### Example Flow
+
+```
+1. juno creates goal "Build House Wire App"
+2. juno assigns TASK-01 to spartan, TASK-02 to cortana
+3. spartan completes TASK-01, cortana completes TASK-02
+4. roland verifies TASK-01 (pass), roland verifies TASK-02 (pass)
+5. juno reviews goal — all tasks verified, integration works
+6. juno verifies goal → GOAL COMPLETE
+```
+
+Full details: [docs/GOALS.md](docs/GOALS.md)
+
 ### Task Lifecycle (Server-Enforced)
 
 ```

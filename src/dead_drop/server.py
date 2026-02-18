@@ -187,11 +187,32 @@ def init_db():
             assigned_to TEXT,
             created_by TEXT NOT NULL,
             status TEXT DEFAULT 'pending'
-                CHECK(status IN ('pending','assigned','in_progress','review','completed','failed')),
+                CHECK(status IN ('pending','assigned','in_progress','review','completed','failed','verified')),
             result TEXT DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            completed_at TEXT
+            completed_at TEXT,
+            role_hat TEXT DEFAULT NULL,
+            goal_id TEXT DEFAULT '',
+            verified_by TEXT DEFAULT '',
+            verified_at TEXT DEFAULT NULL,
+            approved_by TEXT DEFAULT ''
+        )
+    ''')
+    # Phase 7: Goals
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal_id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            project TEXT DEFAULT '',
+            creator TEXT NOT NULL,
+            status TEXT DEFAULT 'open'
+                CHECK(status IN ('open','active','pending_verify','verified','failed')),
+            verified_by TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            verified_at TIMESTAMP DEFAULT NULL
         )
     ''')
     # Phase 2: Handshakes
@@ -281,11 +302,57 @@ def init_db():
     if 'reply_to' not in mcols:
         cursor.execute("ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL")
 
-    # Migrations — tasks
-    cursor.execute("PRAGMA table_info(tasks)")
-    tcols = [c[1] for c in cursor.fetchall()]
-    if 'role_hat' not in tcols:
-        cursor.execute("ALTER TABLE tasks ADD COLUMN role_hat TEXT DEFAULT NULL")
+    # Migrations — tasks: check if CHECK constraint needs 'verified'
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'")
+    schema_row = cursor.fetchone()
+    if schema_row and "'verified'" not in (schema_row[0] or ''):
+        # Rebuild table with updated CHECK constraint
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_cols = [c[1] for c in cursor.fetchall()]
+        cursor.execute('''
+            CREATE TABLE tasks_rebuild (
+                id TEXT PRIMARY KEY,
+                project TEXT DEFAULT '',
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                assigned_to TEXT,
+                created_by TEXT NOT NULL,
+                status TEXT DEFAULT 'pending'
+                    CHECK(status IN ('pending','assigned','in_progress','review','completed','failed','verified')),
+                result TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                role_hat TEXT DEFAULT NULL,
+                goal_id TEXT DEFAULT '',
+                verified_by TEXT DEFAULT '',
+                verified_at TEXT DEFAULT NULL,
+                approved_by TEXT DEFAULT ''
+            )
+        ''')
+        # Copy existing data using only columns that exist
+        base_cols = ['id','project','title','description','assigned_to','created_by','status','result','created_at','updated_at','completed_at']
+        copy_cols = [c for c in base_cols if c in existing_cols]
+        if 'role_hat' in existing_cols:
+            copy_cols.append('role_hat')
+        cols_str = ', '.join(copy_cols)
+        cursor.execute(f'INSERT INTO tasks_rebuild ({cols_str}) SELECT {cols_str} FROM tasks')
+        cursor.execute("DROP TABLE tasks")
+        cursor.execute("ALTER TABLE tasks_rebuild RENAME TO tasks")
+    else:
+        # Table already has 'verified' — just add new columns if missing
+        cursor.execute("PRAGMA table_info(tasks)")
+        tcols = [c[1] for c in cursor.fetchall()]
+        if 'role_hat' not in tcols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN role_hat TEXT DEFAULT NULL")
+        if 'goal_id' not in tcols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN goal_id TEXT DEFAULT ''")
+        if 'verified_by' not in tcols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN verified_by TEXT DEFAULT ''")
+        if 'verified_at' not in tcols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN verified_at TEXT DEFAULT NULL")
+        if 'approved_by' not in tcols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN approved_by TEXT DEFAULT ''")
 
     conn.commit()
     conn.close()
@@ -638,6 +705,8 @@ _TASK_TRANSITIONS = {
     ("in_progress", "failed"): "assignee",
     ("review", "completed"): "lead",
     ("review", "in_progress"): "lead",  # rework
+    ("completed", "verified"): "any",   # verify_task tool handles enforcement
+    ("completed", "in_progress"): "any",  # reject_verification handles enforcement
     ("failed", "assigned"): "lead",     # retry/reassign
 }
 
@@ -1137,7 +1206,7 @@ async def approve_task(agent_name: str, task_id: str, ctx: Context, notes: str =
         if task["status"] != "review":
             return f"Task {task_id} is '{task['status']}', must be 'review' to approve."
 
-        cursor.execute("UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", (now, now, task_id))
+        cursor.execute("UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ?, approved_by = ? WHERE id = ?", (now, now, agent_name, task_id))
 
         # Notify assignee
         if task["assigned_to"]:
@@ -1397,6 +1466,338 @@ async def log_minion(agent_name: str, task_description: str, status: str, result
             return f"Minion updated: id={minion_id} pilot={agent_name} status={status}"
     except Exception as e:
         return f"Error logging minion: {e}"
+    finally:
+        conn.close()
+
+
+# ── Goal / Verification Tools ────────────────────────────────────────
+
+def _next_goal_id(cursor):
+    """Generate next GOAL-XXX id."""
+    cursor.execute("SELECT goal_id FROM goals ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    if row:
+        num = int(row[0].split('-')[1]) + 1
+    else:
+        num = 1
+    return f"GOAL-{num:03d}"
+
+
+def _auto_bump_goal(cursor, goal_id, now):
+    """Check if all tasks for a goal are verified; if so, bump goal to pending_verify. Returns message or None."""
+    if not goal_id:
+        return None
+    cursor.execute("SELECT status FROM goals WHERE goal_id = ?", (goal_id,))
+    goal = cursor.fetchone()
+    if not goal or goal[0] not in ('open', 'active'):
+        return None
+
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE goal_id = ?", (goal_id,))
+    total = cursor.fetchone()[0]
+    if total == 0:
+        return None
+
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE goal_id = ? AND status = 'verified'", (goal_id,))
+    verified_count = cursor.fetchone()[0]
+
+    if verified_count == total:
+        cursor.execute("UPDATE goals SET status = 'pending_verify' WHERE goal_id = ?", (goal_id,))
+        return f"All {total} tasks verified — goal {goal_id} moved to pending_verify."
+    return None
+
+
+@mcp.tool()
+async def create_goal(creator: str, title: str, ctx: Context, description: str = "", project: str = "") -> str:
+    """Create a new goal. Goals group related tasks and require full verification before completion."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        goal_id = _next_goal_id(cursor)
+        cursor.execute(
+            "INSERT INTO goals (goal_id, title, description, project, creator, status, created_at) VALUES (?, ?, ?, ?, ?, 'open', ?)",
+            (goal_id, title, description, project, creator, now)
+        )
+        conn.commit()
+        return f"Goal created: {goal_id} — {title}"
+    except Exception as e:
+        return f"Error creating goal: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def link_task_to_goal(agent_name: str, task_id: str, goal_id: str, ctx: Context) -> str:
+    """Link a task to a goal. Lead only. If goal is open and task is in_progress, bumps goal to active."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can link tasks to goals."
+
+        cursor.execute("SELECT * FROM goals WHERE goal_id = ?", (goal_id,))
+        goal = cursor.fetchone()
+        if not goal:
+            return f"Goal {goal_id} not found."
+        goal = dict(goal)
+
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+
+        cursor.execute("UPDATE tasks SET goal_id = ?, updated_at = ? WHERE id = ?", (goal_id, now, task_id))
+
+        # Auto-bump goal to active if task is in progress
+        if goal["status"] == "open" and task["status"] in ("in_progress", "review", "completed"):
+            cursor.execute("UPDATE goals SET status = 'active' WHERE goal_id = ?", (goal_id,))
+
+        conn.commit()
+        return f"Task {task_id} linked to goal {goal_id}."
+    except Exception as e:
+        return f"Error linking task to goal: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def goal_status(goal_id: str, ctx: Context) -> str:
+    """Get goal info and all linked tasks with their statuses."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM goals WHERE goal_id = ?", (goal_id,))
+        goal = cursor.fetchone()
+        if not goal:
+            return f"Goal {goal_id} not found."
+        goal = dict(goal)
+
+        cursor.execute("SELECT id, title, status, assigned_to, verified_by FROM tasks WHERE goal_id = ? ORDER BY id", (goal_id,))
+        tasks = cursor.fetchall()
+
+        total = len(tasks)
+        verified = sum(1 for t in tasks if t[2] == 'verified')
+        completed = sum(1 for t in tasks if t[2] == 'completed')
+
+        lines = [
+            f"GOAL: {goal['goal_id']} — {goal['title']}",
+            f"Status: {goal['status']} | Project: {goal['project'] or '(none)'} | Creator: {goal['creator']}",
+            f"Progress: {verified}/{total} tasks verified, {completed}/{total} completed",
+            "",
+            "LINKED TASKS:",
+        ]
+        if not tasks:
+            lines.append("  (no tasks linked)")
+        for t in tasks:
+            vby = f" [verified by {t[4]}]" if t[4] else ""
+            lines.append(f"  {t[0]}: {t[1]} — {t[2]} (assigned: {t[3] or 'unassigned'}){vby}")
+
+        if goal['verified_by']:
+            lines.append(f"\nGoal verified by: {goal['verified_by']} at {goal['verified_at']}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting goal status: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def verify_task(agent_name: str, task_id: str, ctx: Context, notes: str = "") -> str:
+    """Independently verify a completed task. Enforces: verifier != builder, verifier != approver, hat conflict check."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+
+        if task["status"] != "completed":
+            return f"Task {task_id} is '{task['status']}', must be 'completed' to verify."
+
+        # Enforcement: verifier != builder
+        if agent_name == task["assigned_to"]:
+            return f"BLOCKED: You ({agent_name}) built this task. Cannot verify your own work."
+
+        # Enforcement: verifier != approver
+        if task.get("approved_by") and agent_name == task["approved_by"]:
+            return f"BLOCKED: You ({agent_name}) approved this task. Cannot also verify it."
+
+        # Enforcement: hat conflict (verifying = tester hat)
+        project = task.get("project", "")
+        conflict = _check_hat_conflict(cursor, agent_name, "tester", project)
+        if conflict:
+            return conflict
+
+        cursor.execute(
+            "UPDATE tasks SET status = 'verified', verified_by = ?, verified_at = ?, updated_at = ? WHERE id = ?",
+            (agent_name, now, now, task_id)
+        )
+
+        # Check if this completes a goal
+        goal_msg = _auto_bump_goal(cursor, task.get("goal_id", ""), now)
+
+        # Notify assignee
+        msg = f"[VERIFIED] {task_id}: {task['title']} — verified by {agent_name}"
+        if notes:
+            msg += f"\nNotes: {notes}"
+        if task["assigned_to"]:
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, task["assigned_to"], msg, now, task_id)
+            )
+
+        # Notify leads if goal bumped
+        notify_targets = []
+        if task["assigned_to"]:
+            notify_targets.append(task["assigned_to"])
+        if goal_msg:
+            leads = _get_leads(cursor)
+            for lead in leads:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                    (agent_name, lead, goal_msg, now, task_id)
+                )
+                notify_targets.append(lead)
+
+        conn.commit()
+        await _notify_agents(notify_targets)
+
+        result = f"Task {task_id} verified by {agent_name}."
+        if goal_msg:
+            result += f"\n{goal_msg}"
+        return result
+    except Exception as e:
+        return f"Error verifying task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def reject_verification(agent_name: str, task_id: str, reason: str, ctx: Context) -> str:
+    """Reject a completed task during verification. Sends it back to in_progress with feedback. Reason is required."""
+    if not reason or not reason.strip():
+        return "Reason is required for rejection."
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        if not task:
+            return f"Task {task_id} not found."
+        task = dict(task)
+
+        if task["status"] != "completed":
+            return f"Task {task_id} is '{task['status']}', must be 'completed' to reject verification."
+
+        # Enforcement: rejector != builder
+        if agent_name == task["assigned_to"]:
+            return f"BLOCKED: You ({agent_name}) built this task. Cannot reject your own work."
+
+        # Enforcement: rejector != approver
+        if task.get("approved_by") and agent_name == task["approved_by"]:
+            return f"BLOCKED: You ({agent_name}) approved this task. Cannot also reject verification."
+
+        cursor.execute(
+            "UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?",
+            (now, task_id)
+        )
+
+        # If goal was pending_verify, bump back to active
+        goal_id = task.get("goal_id", "")
+        if goal_id:
+            cursor.execute("SELECT status FROM goals WHERE goal_id = ?", (goal_id,))
+            goal = cursor.fetchone()
+            if goal and goal[0] == "pending_verify":
+                cursor.execute("UPDATE goals SET status = 'active' WHERE goal_id = ?", (goal_id,))
+
+        # Notify assignee with rejection reason
+        notify_targets = []
+        if task["assigned_to"]:
+            msg = f"[VERIFICATION REJECTED] {task_id}: {task['title']}\nRejected by: {agent_name}\nReason: {reason}\n\nTask sent back to in_progress. Please rework and resubmit."
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, task["assigned_to"], msg, now, task_id)
+            )
+            notify_targets.append(task["assigned_to"])
+
+        conn.commit()
+        await _notify_agents(notify_targets)
+
+        return f"Task {task_id} verification rejected. Sent back to in_progress."
+    except Exception as e:
+        return f"Error rejecting verification: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def verify_goal(agent_name: str, goal_id: str, ctx: Context, notes: str = "") -> str:
+    """Lead verifies a goal after all linked tasks are verified. Final sign-off."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        leads = _get_leads(cursor)
+        if leads and agent_name not in leads:
+            return f"Only a lead ({', '.join(leads)}) can verify goals."
+
+        cursor.execute("SELECT * FROM goals WHERE goal_id = ?", (goal_id,))
+        goal = cursor.fetchone()
+        if not goal:
+            return f"Goal {goal_id} not found."
+        goal = dict(goal)
+
+        if goal["status"] != "pending_verify":
+            return f"Goal {goal_id} is '{goal['status']}', must be 'pending_verify' to verify."
+
+        # Check all tasks are verified
+        cursor.execute("SELECT id, title, status FROM tasks WHERE goal_id = ?", (goal_id,))
+        tasks = cursor.fetchall()
+        not_verified = [(t[0], t[1], t[2]) for t in tasks if t[2] != 'verified']
+        if not_verified:
+            lines = [f"Cannot verify goal — {len(not_verified)} task(s) not yet verified:"]
+            for t in not_verified:
+                lines.append(f"  {t[0]}: {t[1]} — status: {t[2]}")
+            return "\n".join(lines)
+
+        cursor.execute(
+            "UPDATE goals SET status = 'verified', verified_by = ?, verified_at = ? WHERE goal_id = ?",
+            (agent_name, now, goal_id)
+        )
+
+        # Notify all agents who worked on linked tasks
+        notify_targets = []
+        assignees = set()
+        for t in tasks:
+            cursor.execute("SELECT assigned_to FROM tasks WHERE id = ?", (t[0],))
+            row = cursor.fetchone()
+            if row and row[0]:
+                assignees.add(row[0])
+        for assignee in assignees:
+            msg = f"[GOAL VERIFIED] {goal_id}: {goal['title']} — verified by {agent_name}"
+            if notes:
+                msg += f"\nNotes: {notes}"
+            cursor.execute(
+                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                (agent_name, assignee, msg, now, None)
+            )
+            notify_targets.append(assignee)
+
+        conn.commit()
+        await _notify_agents(notify_targets)
+
+        return f"Goal {goal_id} verified by {agent_name}. All {len(tasks)} tasks confirmed."
+    except Exception as e:
+        return f"Error verifying goal: {e}"
     finally:
         conn.close()
 
