@@ -259,7 +259,7 @@ def init_db():
             enabled BOOLEAN DEFAULT 1,
             max_minions INTEGER DEFAULT 3,
             set_by TEXT NOT NULL,
-            set_at TEXT NOT NULL DEFAULT (datetime("now"))
+            set_at TEXT NOT NULL
         )
     ''')
     cursor.execute('''
@@ -268,7 +268,7 @@ def init_db():
             pilot TEXT NOT NULL,
             task_description TEXT NOT NULL,
             status TEXT DEFAULT "spawned",
-            spawned_at TEXT NOT NULL DEFAULT (datetime("now")),
+            spawned_at TEXT NOT NULL,
             completed_at TEXT,
             result TEXT
         )
@@ -712,23 +712,23 @@ _TASK_TRANSITIONS = {
 
 
 @mcp.tool()
-async def create_task(creator: str, title: str, ctx: Context, description: str = "", assign_to: str = "", project: str = "", role_hat: str = "") -> str:
-    """Create a task. Optionally assign it immediately. Returns task ID. Auto-sends assignment message if assigned. role_hat: which role the assignee should wear for this task."""
+async def create_task(creator: str, title: str, ctx: Context, description: str = "", assigned_to: str = "", project: str = "", role_hat: str = "") -> str:
+    """Create a task. Optionally assign it immediately with assigned_to. Returns task ID. Auto-sends assignment message if assigned. role_hat: which role the assignee should wear for this task."""
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
         # Check hat conflict before creating
-        if role_hat and project and assign_to:
-            conflict = _check_hat_conflict(cursor, assign_to, role_hat, project)
+        if role_hat and project and assigned_to:
+            conflict = _check_hat_conflict(cursor, assigned_to, role_hat, project)
             if conflict:
                 return conflict
 
         task_id = _next_task_id(cursor)
-        status = "assigned" if assign_to else "pending"
+        status = "assigned" if assigned_to else "pending"
         cursor.execute(
             "INSERT INTO tasks (id, project, title, description, assigned_to, created_by, status, created_at, updated_at, role_hat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, project, title, description, assign_to or None, creator, status, now, now, role_hat or None)
+            (task_id, project, title, description, assigned_to or None, creator, status, now, now, role_hat or None)
         )
         conn.commit()
 
@@ -737,7 +737,7 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
             result += f" role_hat={role_hat}"
 
         # Auto-send assignment message
-        if assign_to:
+        if assigned_to:
             msg = f"[{task_id}] TASK ASSIGNED: {title}"
             if role_hat:
                 msg += f"\nROLE HAT: {role_hat}"
@@ -745,21 +745,21 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
                 msg += f"\n\n{description}"
             cursor.execute(
                 "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
-                (creator, assign_to, msg, now, task_id)
+                (creator, assigned_to, msg, now, task_id)
             )
             # CC all leads if creator isn't a lead
             leads = _get_leads(cursor)
-            cc_leads = [l for l in leads if l != creator and l != assign_to]
+            cc_leads = [l for l in leads if l != creator and l != assigned_to]
             for lead_name in cc_leads:
                 cursor.execute(
                     "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, cc_original_to, task_id) VALUES (?, ?, ?, ?, 0, 1, ?, ?)",
-                    (creator, lead_name, msg, now, assign_to, task_id)
+                    (creator, lead_name, msg, now, assigned_to, task_id)
                 )
             conn.commit()
-            await _notify_agent(assign_to)
+            await _notify_agent(assigned_to)
             for lead_name in cc_leads:
                 await _notify_agent(lead_name)
-            result += f" → assigned to {assign_to}"
+            result += f" → assigned to {assigned_to}"
 
         return result
     except Exception as e:
@@ -769,8 +769,8 @@ async def create_task(creator: str, title: str, ctx: Context, description: str =
 
 
 @mcp.tool()
-async def update_task(agent_name: str, task_id: str, status: str, ctx: Context, result: str = "") -> str:
-    """Transition a task's status. Enforces valid transitions. Lead can: assign, approve, reject, reassign. Assignee can: start, submit for review, fail."""
+async def update_task(agent_name: str, task_id: str, ctx: Context, status: str = "", assigned_to: str = "", result: str = "") -> str:
+    """Update a task. Can transition status, reassign, or both. Lead can: assign, approve, reject, reassign. Assignee can: start, submit for review, fail."""
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
@@ -780,59 +780,100 @@ async def update_task(agent_name: str, task_id: str, status: str, ctx: Context, 
         if not task:
             return f"Task {task_id} not found."
         task = dict(task)
-        old_status = task["status"]
-        transition = (old_status, status)
 
-        if transition not in _TASK_TRANSITIONS:
-            valid = [t[1] for t in _TASK_TRANSITIONS if t[0] == old_status]
-            return f"Invalid transition: {old_status} → {status}. Valid: {', '.join(valid) if valid else 'none (terminal state)'}"
+        if not status and not assigned_to and not result:
+            return "Nothing to update. Provide status, assigned_to, or result."
 
-        required_role = _TASK_TRANSITIONS[transition]
-        leads = _get_leads(cursor)
+        updates = []
+        params = []
+        notify_targets = []
+        messages = []
 
-        if required_role == "lead" and agent_name not in leads:
-            return f"Only a lead ({', '.join(leads) or 'none registered'}) can transition {old_status} → {status}."
-        if required_role == "assignee" and agent_name != task["assigned_to"]:
-            return f"Only the assigned agent ({task['assigned_to']}) can transition {old_status} → {status}."
+        # Handle reassignment
+        if assigned_to:
+            leads = _get_leads(cursor)
+            if agent_name not in leads:
+                return f"Only a lead can reassign tasks."
+            updates.append("assigned_to = ?")
+            params.append(assigned_to)
+            messages.append(f"[{task_id}] Reassigned to {assigned_to} by {agent_name}")
+            notify_targets.append(assigned_to)
 
-        # Handle assignment — allow reassigning on failed→assigned
-        update_fields = "status = ?, updated_at = ?"
-        params = [status, now]
+        # Handle status transition
+        if status:
+            old_status = task["status"]
+            transition = (old_status, status)
+
+            if transition not in _TASK_TRANSITIONS:
+                valid = [t[1] for t in _TASK_TRANSITIONS if t[0] == old_status]
+                return f"Invalid transition: {old_status} → {status}. Valid: {', '.join(valid) if valid else 'none (terminal state)'}"
+
+            required_role = _TASK_TRANSITIONS[transition]
+            leads = _get_leads(cursor)
+
+            if required_role == "lead" and agent_name not in leads:
+                return f"Only a lead ({', '.join(leads) or 'none registered'}) can transition {old_status} → {status}."
+            effective_assignee = assigned_to or task["assigned_to"]
+            if required_role == "assignee" and agent_name != effective_assignee:
+                return f"Only the assigned agent ({effective_assignee}) can transition {old_status} → {status}."
+
+            updates.append("status = ?")
+            params.append(status)
+            if status == "completed":
+                updates.append("completed_at = ?")
+                params.append(now)
+
         if result:
-            update_fields += ", result = ?"
+            updates.append("result = ?")
             params.append(result)
-        if status == "completed":
-            update_fields += ", completed_at = ?"
-            params.append(now)
+
+        updates.append("updated_at = ?")
+        params.append(now)
         params.append(task_id)
-        cursor.execute(f"UPDATE tasks SET {update_fields} WHERE id = ?", params)
+        cursor.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", params)
 
         # Auto-notify relevant parties
-        notify_targets = []
-        msg = f"[{task_id}] Status: {old_status} → {status}"
-        if result:
-            msg += f"\n\n{result}"
+        if status:
+            old_status = task["status"]
+            msg = f"[{task_id}] Status: {old_status} → {status}"
+            if result:
+                msg += f"\n\n{result}"
+            required_role = _TASK_TRANSITIONS.get((old_status, status), "any")
+            leads = _get_leads(cursor)
 
-        if required_role == "assignee" and leads:
-            # Assignee changed status → notify all leads
-            for lead_name in leads:
+            if required_role == "assignee" and leads:
+                for lead_name in leads:
+                    cursor.execute(
+                        "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                        (agent_name, lead_name, msg, now, task_id)
+                    )
+                    notify_targets.append(lead_name)
+            elif required_role == "lead" and task["assigned_to"]:
                 cursor.execute(
                     "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
-                    (agent_name, lead_name, msg, now, task_id)
+                    (agent_name, task["assigned_to"], msg, now, task_id)
                 )
-                notify_targets.append(lead_name)
-        elif required_role == "lead" and task["assigned_to"]:
-            # Lead changed status → notify assignee
-            cursor.execute(
-                "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
-                (agent_name, task["assigned_to"], msg, now, task_id)
-            )
-            notify_targets.append(task["assigned_to"])
+                notify_targets.append(task["assigned_to"])
+
+        # Send reassignment messages
+        for msg_text in messages:
+            for target in notify_targets:
+                cursor.execute(
+                    "INSERT INTO messages (from_agent, to_agent, content, timestamp, read_flag, is_cc, task_id) VALUES (?, ?, ?, ?, 0, 0, ?)",
+                    (agent_name, target, msg_text, now, task_id)
+                )
 
         conn.commit()
         await _notify_agents(notify_targets)
 
-        return f"Task {task_id}: {old_status} → {status}"
+        parts = []
+        if status:
+            parts.append(f"Task {task_id}: {task['status']} → {status}")
+        if assigned_to:
+            parts.append(f"assigned to {assigned_to}")
+        if result:
+            parts.append(f"result updated")
+        return " | ".join(parts) if parts else f"Task {task_id} updated."
     except Exception as e:
         return f"Error updating task: {e}"
     finally:
