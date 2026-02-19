@@ -5,10 +5,10 @@ Runs on Proxmox VM (kratos), manages team registry, rooms, and Docker sub-server
 Port: 9500 (configurable via DD_HUB_PORT)
 Transport: Streamable HTTP at /mcp
 
-11 MCP Tools:
+14 MCP Tools:
     register_team, list_teams, create_room, list_rooms, join_room,
     leave_room, archive_room, destroy_room, room_status, get_my_rooms,
-    pin_room
+    pin_room, create_workspace, list_workspaces, destroy_workspace
 
 HTTP Endpoints:
     GET /status — hub health dashboard
@@ -86,6 +86,21 @@ def init_db():
             created_at TEXT NOT NULL,
             archived_at TEXT,
             pinned BOOLEAN DEFAULT FALSE
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS workspaces (
+            name TEXT PRIMARY KEY,
+            teams TEXT NOT NULL,
+            project TEXT DEFAULT '',
+            port INTEGER NOT NULL,
+            container_id TEXT NOT NULL,
+            password TEXT NOT NULL,
+            status TEXT DEFAULT 'active'
+                CHECK(status IN ('starting', 'active', 'destroyed')),
+            handshake_id INTEGER,
+            created_at TEXT NOT NULL
         )
     ''')
 
@@ -517,6 +532,144 @@ async def pin_room(room_name: str) -> str:
 
 
 # =============================================================================
+# Workspace Tools (3)
+# =============================================================================
+
+@mcp.tool()
+async def create_workspace(creator: str, name: str, teams: str, project: str = "", handshake_id: int = 0) -> str:
+    """Create a shared dev workspace. Spawns an SSH-accessible Docker container. Teams is comma-separated. Returns SSH credentials."""
+    conn = get_db()
+    cursor = conn.cursor()
+    now = _now()
+
+    try:
+        team_list = [t.strip() for t in teams.split(",") if t.strip()]
+        if not team_list:
+            return "At least one team is required."
+
+        # Validate all teams exist
+        for team_name in team_list:
+            cursor.execute("SELECT name FROM teams WHERE name = ?", (team_name,))
+            if not cursor.fetchone():
+                return f"Team '{team_name}' not registered. Call register_team first."
+
+        # Check for duplicate
+        cursor.execute("SELECT name FROM workspaces WHERE name = ? AND status IN ('active', 'starting')", (name,))
+        if cursor.fetchone():
+            return f"Active workspace '{name}' already exists."
+
+        # Allocate port
+        port = spawner.allocate_workspace_port()
+        if port is None:
+            return "No workspace ports available."
+
+        # Generate password
+        import secrets
+        import string
+        password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+
+        teams_json = json.dumps(team_list)
+
+        # Create record
+        cursor.execute("""
+            INSERT INTO workspaces (name, teams, project, port, container_id, password, status, handshake_id, created_at)
+            VALUES (?, ?, ?, ?, '', ?, 'starting', ?, ?)
+        """, (name, teams_json, project, port, password, handshake_id, now))
+        conn.commit()
+
+        # Spawn Docker container
+        try:
+            container_id = spawner.spawn_workspace(name, port, password, teams_json)
+            cursor.execute(
+                "UPDATE workspaces SET status = 'active', container_id = ? WHERE name = ?",
+                (container_id, name)
+            )
+            conn.commit()
+
+            host = os.getenv("DD_HUB_HOST", "192.168.2.142")
+            ssh_cmd = f"ssh root@{host} -p {port}"
+
+            return json.dumps({
+                "workspace": name,
+                "port": port,
+                "password": password,
+                "ssh_command": ssh_cmd,
+                "host": host,
+                "container_id": container_id[:12],
+                "teams": team_list,
+                "project": project,
+                "message": f"Workspace '{name}' ready. Connect: {ssh_cmd} (password: {password}). Files go in /workspace/",
+            }, indent=2)
+
+        except Exception as e:
+            cursor.execute("UPDATE workspaces SET status = 'destroyed' WHERE name = ?", (name,))
+            conn.commit()
+            return f"Workspace record created but container failed to start: {e}"
+
+    except Exception as e:
+        return f"Error creating workspace: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def list_workspaces(status: str = "active") -> str:
+    """List workspaces with container health. Filter by status: 'active', 'destroyed', or '' for all."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        if status:
+            cursor.execute("SELECT * FROM workspaces WHERE status = ? ORDER BY created_at DESC", (status,))
+        else:
+            cursor.execute("SELECT * FROM workspaces ORDER BY created_at DESC")
+        workspaces = []
+        for row in cursor.fetchall():
+            ws = dict(row)
+            ws["teams"] = json.loads(ws["teams"])
+            ws.pop("password", None)  # Don't expose passwords in list
+
+            if ws["status"] == "active":
+                ws["container_health"] = spawner.get_workspace_health(ws["name"])
+
+            workspaces.append(ws)
+
+        return json.dumps(workspaces, indent=2)
+    except Exception as e:
+        return f"Error listing workspaces: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+async def destroy_workspace(workspace_name: str) -> str:
+    """Destroy a workspace. Stops container. Workspace files are preserved on host at /var/lib/dead-drop/workspaces/{name}/."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT * FROM workspaces WHERE name = ?", (workspace_name,))
+        ws = cursor.fetchone()
+        if not ws:
+            return f"Workspace '{workspace_name}' not found."
+        ws = dict(ws)
+
+        if ws["status"] == "destroyed":
+            return f"Workspace '{workspace_name}' is already destroyed."
+
+        # Stop container (data preserved in volume)
+        spawner.stop_workspace(workspace_name)
+
+        cursor.execute("UPDATE workspaces SET status = 'destroyed' WHERE name = ?", (workspace_name,))
+        conn.commit()
+
+        return f"Workspace '{workspace_name}' destroyed. Container stopped. Files preserved at /var/lib/dead-drop/workspaces/{workspace_name}/"
+    except Exception as e:
+        return f"Error destroying workspace: {e}"
+    finally:
+        conn.close()
+
+
+# =============================================================================
 # GET /status HTTP Endpoint
 # =============================================================================
 
@@ -547,6 +700,16 @@ async def _status_endpoint(request: Request) -> JSONResponse:
             room["container"] = spawner.get_room_health(room["name"])
             rooms.append(room)
 
+        # Workspaces
+        cursor.execute("SELECT * FROM workspaces WHERE status = 'active' ORDER BY created_at DESC")
+        workspaces = []
+        for row in cursor.fetchall():
+            ws = dict(row)
+            ws["teams"] = json.loads(ws["teams"])
+            ws.pop("password", None)
+            ws["container"] = spawner.get_workspace_health(ws["name"])
+            workspaces.append(ws)
+
         # Resource counts
         from dead_drop.spawner import PORT_RANGE_START, PORT_RANGE_END
         total_ports = PORT_RANGE_END - PORT_RANGE_START + 1
@@ -555,10 +718,12 @@ async def _status_endpoint(request: Request) -> JSONResponse:
         result = {
             "teams": teams,
             "rooms": rooms,
+            "workspaces": workspaces,
             "resources": {
-                "containers_active": active_count,
-                "ports_used": active_count,
-                "ports_available": total_ports - active_count,
+                "containers_active": active_count + len(workspaces),
+                "room_ports_used": active_count,
+                "room_ports_available": total_ports - active_count,
+                "workspace_count": len(workspaces),
             },
             "timestamp": _now(),
         }

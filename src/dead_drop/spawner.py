@@ -43,6 +43,13 @@ CONTAINER_PREFIX = "dead-drop-room-"
 IDLE_TIMEOUT = 3600  # 1 hour — auto-reap idle rooms
 ARCHIVE_TTL_DAYS = 90
 
+# Workspace containers — shared dev environments for cross-team collaboration
+WORKSPACE_IMAGE = os.getenv("DD_WORKSPACE_IMAGE", "dead-drop-workspace:latest")
+WORKSPACE_PORT_START = int(os.getenv("DD_WS_PORT_START", "10501"))
+WORKSPACE_PORT_END = int(os.getenv("DD_WS_PORT_END", "11500"))
+WORKSPACE_DATA_DIR = os.getenv("DD_WORKSPACE_DATA_DIR", "/var/lib/dead-drop/workspaces")
+WORKSPACE_PREFIX = "dead-drop-ws-"
+
 
 class Spawner:
     """Manages Docker containers for dead-drop room sub-servers."""
@@ -312,6 +319,130 @@ class Spawner:
             logger.error(f"Error during cleanup: {e}")
 
         return removed
+
+    # =========================================================================
+    # Workspace Containers — Shared Dev Environments
+    # =========================================================================
+
+    def allocate_workspace_port(self):
+        """Find next available workspace port. Returns port or None."""
+        conn = self._get_db()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT port FROM workspaces WHERE status IN ('active', 'starting') ORDER BY port"
+            )
+            used_ports = {row[0] for row in cursor.fetchall()}
+
+            for port in range(WORKSPACE_PORT_START, WORKSPACE_PORT_END + 1):
+                if port not in used_ports:
+                    return port
+            return None
+        finally:
+            conn.close()
+
+    def spawn_workspace(self, name, port, password, teams=""):
+        """
+        Spawn a Docker workspace container for cross-team development.
+
+        Args:
+            name: Workspace name (used as container suffix and data dir name)
+            port: Host port to map to container's SSH port 22
+            password: Root password for SSH access
+            teams: JSON string of team names (for container labels)
+
+        Returns:
+            container_id (str) or raises exception
+        """
+        if not self.client:
+            raise RuntimeError("Docker not connected")
+
+        container_name = f"{WORKSPACE_PREFIX}{name}"
+
+        # Create workspace data directory
+        ws_data_dir = os.path.join(WORKSPACE_DATA_DIR, name)
+        os.makedirs(ws_data_dir, exist_ok=True)
+
+        try:
+            container = self.client.containers.run(
+                WORKSPACE_IMAGE,
+                name=container_name,
+                detach=True,
+                restart_policy={"Name": "unless-stopped"},
+                ports={"22/tcp": port},
+                environment={
+                    "DD_WORKSPACE_PASSWORD": password,
+                    "DD_WORKSPACE_NAME": name,
+                },
+                volumes={
+                    ws_data_dir: {"bind": "/workspace", "mode": "rw"},
+                },
+                healthcheck={
+                    "test": ["CMD", "bash", "-c",
+                             "echo | nc -w2 localhost 22 | grep -q SSH"],
+                    "interval": 30_000_000_000,
+                    "timeout": 5_000_000_000,
+                    "retries": 3,
+                    "start_period": 5_000_000_000,
+                },
+                mem_limit="512m",
+                nano_cpus=1_000_000_000,  # 1 CPU
+                labels={
+                    "dead-drop.workspace": name,
+                    "dead-drop.type": "workspace",
+                    "dead-drop.teams": teams if isinstance(teams, str) else json.dumps(teams),
+                },
+            )
+            logger.info(f"Workspace {container_name} started on SSH port {port}")
+            return container.id
+
+        except docker.errors.APIError as e:
+            if "Conflict" in str(e):
+                logger.warning(f"Workspace {container_name} already exists, removing and recreating")
+                self.stop_workspace(name)
+                return self.spawn_workspace(name, port, password, teams)
+            raise
+
+    def stop_workspace(self, name):
+        """Stop and remove a workspace container."""
+        if not self.client:
+            raise RuntimeError("Docker not connected")
+
+        container_name = f"{WORKSPACE_PREFIX}{name}"
+        try:
+            container = self.client.containers.get(container_name)
+            container.stop(timeout=10)
+            container.remove()
+            logger.info(f"Workspace {container_name} stopped and removed")
+            return True
+        except docker.errors.NotFound:
+            logger.warning(f"Workspace {container_name} not found")
+            return False
+        except Exception as e:
+            logger.error(f"Error stopping workspace {container_name}: {e}")
+            return False
+
+    def get_workspace_health(self, name):
+        """Get workspace container health and status."""
+        if not self.client:
+            return {"status": "docker_unavailable", "running": False, "health": "unknown"}
+
+        container_name = f"{WORKSPACE_PREFIX}{name}"
+        try:
+            container = self.client.containers.get(container_name)
+            state = container.attrs.get("State", {})
+            health_obj = state.get("Health", {})
+            return {
+                "status": container.status,
+                "running": state.get("Running", False),
+                "health": health_obj.get("Status", "unknown"),
+                "started_at": state.get("StartedAt", ""),
+                "container_id": container.short_id,
+            }
+        except docker.errors.NotFound:
+            return {"status": "not_found", "running": False, "health": "unknown"}
+        except Exception as e:
+            return {"status": "error", "running": False, "health": "unknown", "error": str(e)}
 
     # =========================================================================
     # Archive

@@ -1,0 +1,53 @@
+FROM debian:12-slim
+
+LABEL maintainer="dead-drop-teams"
+LABEL description="Shared development workspace for cross-team collaboration"
+
+# System packages + SSH server
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
+    build-essential \
+    jq \
+    vim-tiny \
+    less \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 via nodesource
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# SSH configuration
+RUN mkdir -p /run/sshd \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
+    && echo 'ClientAliveInterval 60' >> /etc/ssh/sshd_config \
+    && echo 'ClientAliveCountMax 10' >> /etc/ssh/sshd_config
+
+# Workspace directory
+RUN mkdir -p /workspace && chmod 777 /workspace
+
+# Git global config
+RUN git config --global init.defaultBranch main \
+    && git config --global user.email "workspace@dead-drop" \
+    && git config --global user.name "Dead Drop Workspace"
+
+EXPOSE 22
+VOLUME /workspace
+
+# Health check — verify SSH is accepting connections
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD bash -c 'echo | nc -w2 localhost 22 | grep -q SSH' || exit 1
+
+# Password set at runtime via DD_WORKSPACE_PASSWORD env var
+ENV DD_WORKSPACE_PASSWORD=changeme
+
+CMD bash -c 'echo "root:${DD_WORKSPACE_PASSWORD}" | chpasswd && exec /usr/sbin/sshd -D'
